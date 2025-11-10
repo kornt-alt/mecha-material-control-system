@@ -12,8 +12,8 @@ app.use(express.json());
 app.use(cors());
 
 // ========== STATIC FILE SERVING ==========
-app.use('/MECHATOOLINGPS', express.static(path.join(__dirname, 'build')));
-app.use('/MECHATOOLINGPS/static', express.static(path.join(__dirname, 'build/static')));
+app.use('/MECHA-MATERIAL-SYSTEM', express.static(path.join(__dirname, 'build')));
+app.use('/MECHA-MATERIAL-SYSTEM/static', express.static(path.join(__dirname, 'build/static')));
 
 // Database configuration
 const dbConfig = {
@@ -83,7 +83,17 @@ const requireCommon = (req, res, next) => {
   next();
 };
 
+// ========== NEW MIDDLEWARE FOR RECEIVE ROLE ========== //
+const requireReceiveRole = (req, res, next) => {
+  if (!['ADMIN', 'RECEIVE'].includes(req.user.role)) {
+    return res.status(403).json({ message: 'ADMIN or RECEIVE role required' });
+  }
+  next();
+};
+// =================================================== //
+
 // Log action to the database
+// ... (ฟังก์ชัน logAction ของคุณเหมือนเดิม) ...
 const logAction = async (action, targetId, targetType, comment) => {
   try {
     if (!action || !targetType) {
@@ -513,209 +523,595 @@ app.post('/api/change-password', verifyToken, async (req, res) => {
   }
 });
 
-// Fetch storage data
-app.get('/api/storage', verifyToken, async (req, res) => {
-  try {
-    const pool = await poolPromise;
-    const request = pool.request();
-    let query;
 
-    if (req.user.role === 'ADMIN') {
-      query = `
-        SELECT 
-          r.po_no, 
-          r.vendor, 
-          r.item_name, 
-          r.item_spec, 
-          r.qty, 
-          r.unit, 
-          r.org,
-          r.confirm_to,
-          r.mfg,
-          DATEDIFF(day, r.date, GETDATE()) AS duration_day, 
-          r.division 
-        FROM ReceiveEntries r
-        WHERE r.po_no NOT IN (SELECT DISTINCT po_no FROM IssueEntries WHERE po_no IS NOT NULL)
-      `;
-    } else if (req.user.division === 'Common') {
-      const userOrgs = req.user.org.split(',').map(org => org.trim());
-      const orgConditions = userOrgs.map((_, index) => `r.org = @org${index}`).join(' OR ');
-      
-      query = `
-        SELECT r.po_no, 
-              r.vendor, 
-              r.item_name, 
-              r.item_spec, 
-              r.qty, 
-              r.unit, 
-              r.org,
-              r.confirm_to,
-              r.mfg,
-              DATEDIFF(day, r.date, GETDATE()) AS duration_day, 
-              r.division
-              FROM ReceiveEntries r
-              WHERE (${orgConditions})
-              AND r.po_no NOT IN (SELECT DISTINCT po_no FROM IssueEntries WHERE po_no IS NOT NULL)
-      `;
-      
-      userOrgs.forEach((org, index) => {
-        request.input(`org${index}`, sql.VarChar, org);
-      });
-    } else if (req.user.division === 'M/P 1') {
-      const userOrgs = req.user.org.split(',').map(org => org.trim());
-      const orgConditions = userOrgs.map((_, index) => `r.org = @org${index}`).join(' OR ');
-      
-      query = `
-        SELECT r.po_no, 
-              r.vendor, 
-              r.item_name, 
-              r.item_spec, 
-              r.qty, 
-              r.unit, 
-              r.org,
-              r.confirm_to,
-              r.mfg,
-              DATEDIFF(day, r.date, GETDATE()) AS duration_day, 
-              r.division
-              FROM ReceiveEntries r
-              WHERE (${orgConditions}) AND r.division = 'M/P 1'
-              AND r.po_no NOT IN (SELECT DISTINCT po_no FROM IssueEntries WHERE po_no IS NOT NULL)
-      `;
-      
-      userOrgs.forEach((org, index) => {
-        request.input(`org${index}`, sql.VarChar, org);
-      });
-    } else if (req.user.division === 'M/P 2') {
-      const userOrgs = req.user.org.split(',').map(org => org.trim());
-      const orgConditions = userOrgs.map((_, index) => `r.org = @org${index}`).join(' OR ');
-      
-      query = `
-        SELECT r.po_no, 
-              r.vendor, 
-              r.item_name, 
-              r.item_spec, 
-              r.qty, 
-              r.unit, 
-              r.org,
-              r.confirm_to,
-              r.mfg,
-              DATEDIFF(day, r.date, GETDATE()) AS duration_day, 
-              r.division
-              FROM ReceiveEntries r
-              WHERE (${orgConditions}) AND r.division = 'M/P 2'
-              AND r.po_no NOT IN (SELECT DISTINCT po_no FROM IssueEntries WHERE po_no IS NOT NULL)
-      `;
-      
-      userOrgs.forEach((org, index) => {
-        request.input(`org${index}`, sql.VarChar, org);
-      });
-    } else {
-      query = `
-        SELECT 
-          r.po_no, 
-          r.vendor, 
-          r.item_name, 
-          r.item_spec, 
-          r.qty, 
-          r.unit, 
-          r.org,
-          r.confirm_to,
-          r.mfg,
-          DATEDIFF(day, r.date, GETDATE()) AS duration_day, 
-          r.division 
-        FROM ReceiveEntries r
-        WHERE  r.po_no NOT IN (SELECT DISTINCT po_no FROM IssueEntries WHERE po_no IS NOT NULL)
-      `;
-      request.input('userid', sql.VarChar, req.user.userid);
+// ========== NEW API ROUTES FOR RECEIVE & INVENTORY ========== //
+
+app.post('/api/inventory/direct-receive', verifyToken, requireReceiveRole, async (req, res) => {
+  const { itemNo, location, actualQty } = req.body;
+  const userId = req.user.userid;
+
+  if (!itemNo || !location || !actualQty || actualQty <= 0) {
+    return res.status(400).json({ message: 'Item No, Location, and a valid Qty are required' });
+  }
+
+  const pool = await poolPromise;
+  
+  // --- VALIDATION ---
+  try {
+    const itemCheckRequest = pool.request();
+    itemCheckRequest.input('itemNo', sql.NVarChar, itemNo);
+    const itemResult = await itemCheckRequest.query('SELECT ITEM_NO FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
+    
+    if (itemResult.recordset.length === 0) {
+      // นี่คือ Error ที่คุณขอ
+      return res.status(404).json({ message: 'ไม่พบ item no นี้ใน Master กรุณาตรวจสอบใหม่อีกครั้ง' });
     }
 
-    const result = await request.query(query);
-    res.json(result.recordset);
+    const transaction = pool.transaction();
+    await transaction.begin();
+    
+    // (ส่วนที่เหลือของ try block... MERGE query)
+    const stockRequest = transaction.request();
+    stockRequest.input('itemNo', sql.NVarChar, itemNo);
+    stockRequest.input('locationName', sql.NVarChar, location);
+    stockRequest.input('receivedQty', sql.Decimal(18, 4), parseFloat(actualQty));
+
+    // ใช้ MERGE (Upsert) เพื่ออัปเดตสต็อกทันที
+    const mergeStockQuery = `
+      MERGE INTO MC_INVENTORY_STOCK AS target
+      USING (SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME) AS source
+      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      
+      WHEN MATCHED THEN
+        UPDATE SET 
+          QTY = target.QTY + @receivedQty,
+          LAST_UPDATE = GETDATE()
+          
+      WHEN NOT MATCHED THEN
+        INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
+        VALUES (@itemNo, @locationName, @receivedQty, GETDATE());
+    `;
+
+    await stockRequest.query(mergeStockQuery);
+    
+    await transaction.commit();
+    await logAction('DIRECT_RECEIVE', itemNo, 'INVENTORY', `Direct received ${actualQty} of ${itemNo} to ${location} by ${userId}`);
+    res.json({ message: 'Stock updated successfully (Direct Receive)' });
+
   } catch (err) {
-    console.error('Error fetching storage data:', err);
-    res.status(500).json({ message: 'Failed to fetch storage data' });
+    // (ย้าย transaction.rollback() มาไว้ใน catch block หลัก)
+    // await transaction.rollback(); // (ถ้า transaction ถูกสร้างแล้ว)
+    console.error('Error during direct receive:', err);
+    res.status(500).json({ message: err.message || 'Failed to update stock' });
   }
 });
 
-// Fetch history data
-app.get('/api/history', verifyToken, async (req, res) => {
+// 1. API สำหรับสร้างแผนการรับของ (Receive Schedule)
+app.post('/api/receive/schedule', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const { itemNo, location, scheduledQty, scheduledDateTime } = req.body;
+
+    // 1. ตรวจสอบข้อมูลเบื้องต้น
+    if (!itemNo || !location || !scheduledQty || !scheduledDateTime) {
+      return res.status(400).json({ message: 'Missing required fields: itemNo, location, scheduledQty, scheduledDateTime' });
+    }
+
+    const pool = await poolPromise;
+
+    // 2. ดึง DIVISION_SCRIPT จากตาราง Master เพื่อใช้ในการกรองสิทธิ์
+    const itemRequest = pool.request();
+    itemRequest.input('itemNo', sql.NVarChar, itemNo);
+    const itemResult = await itemRequest.query('SELECT DIVISION_SCRIPT FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
+
+    if (itemResult.recordset.length === 0) {
+      return res.status(404).json({ message: 'Item Not Found in Master' });
+    }
+    const divisionScript = itemResult.recordset[0].DIVISION_SCRIPT;
+    
+    // (Optional) ตรวจสอบสิทธิ์ Division ตรงนี้
+    if (req.user.role !== 'ADMIN' && req.user.division !== divisionScript) {
+      return res.status(403).json({ message: 'คุณเป็นคนไม่มีสิทธิ์ - Hugo' });
+    }
+
+    // 3. บันทึกแผนลงในตาราง MC_SCHEDULED_RECEIVES
+    const scheduleRequest = pool.request();
+    scheduleRequest.input('itemNo', sql.NVarChar, itemNo);
+    scheduleRequest.input('scheduledDateTime', sql.DateTime, new Date(scheduledDateTime));
+    scheduleRequest.input('scheduledQty', sql.Decimal(18, 4), parseFloat(scheduledQty));
+    scheduleRequest.input('locationName', sql.NVarChar, location); // เช่น 'FACTORY_6'
+    scheduleRequest.input('status', sql.NVarChar, 'PENDING');
+    scheduleRequest.input('divisionScript', sql.NVarChar, divisionScript);
+    
+    const insertQuery = `
+      INSERT INTO MC_SCHEDULED_RECEIVES 
+        (ITEM_NO, SCHEDULED_DATETIME, SCHEDULED_QTY, LOCATION_NAME, STATUS, DIVISION_SCRIPT)
+      VALUES 
+        (@itemNo, @scheduledDateTime, @scheduledQty, @locationName, @status, @divisionScript);
+      
+      SELECT SCOPE_IDENTITY() AS scheduleId; -- ส่ง ID ของแถวที่สร้างใหม่กลับไป
+    `;
+    
+    const result = await scheduleRequest.query(insertQuery);
+    const newScheduleId = result.recordset[0].scheduleId;
+
+    res.status(201).json({ 
+      message: 'Receive schedule created successfully', 
+      scheduleId: newScheduleId 
+    });
+
+  } catch (err) {
+    console.error('Error creating receive schedule:', err);
+    res.status(500).json({ message: 'Failed to create schedule' });
+  }
+});
+
+// 2. API สำหรับดึงรายการที่ต้องยืนยัน (สำหรับ Popup)
+app.get('/api/receive/pending', verifyToken, requireReceiveRole, async (req, res) => {
   try {
     const pool = await poolPromise;
     const request = pool.request();
+    
+    // สร้างเงื่อนไข WHERE ตามสิทธิ์
+    const whereConditions = [
+      "s.STATUS = 'PENDING'",
+      "s.SCHEDULED_DATETIME <= GETDATE()"
+    ];
 
-    let whereClause = '';
-    if (req.user.role === 'ADMIN') {
-      // ADMIN เห็นข้อมูลทั้งหมด ไม่ต้องมีเงื่อนไขเพิ่มเติม
-      whereClause = ''; 
-    } else if (req.user.division === 'M/P 1') {
-      whereClause = " AND IM.division = 'M/P 1'";
-    } else if (req.user.division === 'M/P 2') {
-      whereClause = " AND IM.division = 'M/P 2'";
-    } else {
-      // User ทั่วไป เห็นเฉพาะ item ที่ตัวเองเป็นคนสร้าง (add_item_master_by)
-      whereClause = " AND IM.add_item_master_by = @issued_by";
-      request.input('issued_by', sql.NVarChar, req.user.name);
+    // กรองสิทธิ์ตาม Division ที่ User ถืออยู่
+    if (req.user.role !== 'ADMIN') {
+      // ตรงกับ `s.DIVISION_SCRIPT` ใน MC_SCHEDULED_RECEIVES
+      whereConditions.push(`s.DIVISION_SCRIPT = @userDivision`);
+      request.input('userDivision', sql.NVarChar, req.user.division);
+      
+      // (ถ้าต้องกรองตาม org ด้วย ก็เพิ่ม logic ที่นี่)
     }
-
+    
     const query = `
-      WITH CabinetInfo AS (
-        SELECT
-            CabinetID,
-            CONCAT(CabinetName, '-', CabinetLevel, '-', CabinetNo) AS Location
-        FROM
-            Cabinets
-      ),
-      FullData AS (
-        SELECT
-            i.ItemNo, i.iqc, i.OnStock, i.Active,
-            ci_iqc.Location AS IQC_Location,
-            ci_onstock.Location AS OnStock_Location,
-            ci_active.Location AS Active_Location
-        FROM
-            Items AS i
-            LEFT JOIN CabinetInfo AS ci_iqc ON i.CabinetID_IQC = ci_iqc.CabinetID
-            LEFT JOIN CabinetInfo AS ci_onstock ON i.CabinetID_OnStock = ci_onstock.CabinetID
-            LEFT JOIN CabinetInfo AS ci_active ON i.CabinetID_Active = ci_active.CabinetID
-      )
-
-      SELECT
-          FullData.ItemNo, IM.item_name, IM.vendor_code, IM.vendor_name, IM.spec,
-          IM.drwg, IM.account, IM.unit_price, IM.currency, IM.safety_stock, IM.division,
-          IM.created_at, 'IQC' AS Type, FullData.iqc AS Qty, FullData.IQC_Location AS Location
-      FROM FullData
-      LEFT JOIN ItemMaster AS IM ON FullData.ItemNo = IM.item_no
-      WHERE FullData.iqc > 0 ${whereClause}
-
-      UNION ALL
-
-      SELECT
-          FullData.ItemNo, IM.item_name, IM.vendor_code, IM.vendor_name, IM.spec,
-          IM.drwg, IM.account, IM.unit_price, IM.currency, IM.safety_stock, IM.division,
-          IM.created_at, 'OnStock' AS Type, FullData.OnStock AS Qty, FullData.OnStock_Location AS Location
-      FROM FullData
-      LEFT JOIN ItemMaster AS IM ON FullData.ItemNo = IM.item_no
-      WHERE FullData.OnStock > 0 ${whereClause}
-
-      UNION ALL
-
-      SELECT
-          FullData.ItemNo, IM.item_name, IM.vendor_code, IM.vendor_name, IM.spec,
-          IM.drwg, IM.account, IM.unit_price, IM.currency, IM.safety_stock, IM.division,
-          IM.created_at, 'Active' AS Type, FullData.Active AS Qty, FullData.Active_Location AS Location
-      FROM FullData
-      LEFT JOIN ItemMaster AS IM ON FullData.ItemNo = IM.item_no
-      WHERE FullData.Active > 0 ${whereClause}
-
-      ORDER BY
-          ItemNo, Type;
+      SELECT 
+        s.SCHEDULE_ID, 
+        s.ITEM_NO, 
+        i.ITEM_NAME, 
+        s.SCHEDULED_QTY, 
+        s.SCHEDULED_DATETIME, 
+        s.LOCATION_NAME
+      FROM MC_SCHEDULED_RECEIVES s
+      LEFT JOIN MC_ITEM_MASTER i ON s.ITEM_NO = i.ITEM_NO
+      WHERE ${whereConditions.join(' AND ')}
+      ORDER BY s.SCHEDULED_DATETIME ASC;
     `;
-
+    
     const result = await request.query(query);
     res.json(result.recordset);
 
   } catch (err) {
-    console.error('Error fetching inventory report:', err);
-    res.status(500).json({ message: 'Failed to fetch inventory report' });
+    console.error('Error fetching pending receives:', err);
+    res.status(500).json({ message: 'Failed to fetch pending receives' });
+  }
+});
+
+// 3. API สำหรับยืนยันการรับของ (Confirm Receive)
+app.post('/api/receive/confirm/:scheduleId', verifyToken, requireReceiveRole, async (req, res) => {
+  const { scheduleId } = req.params;
+  const { actualQty } = req.body;
+  const userId = req.user.userid;
+
+  if (actualQty === undefined || actualQty === null) {
+    return res.status(400).json({ message: 'Actual Qty is required' });
+  }
+
+  const pool = await poolPromise;
+  const transaction = pool.transaction();
+
+  try {
+    await transaction.begin();
+
+    // --- Step 1: อัปเดตตาราง Schedule และดึงข้อมูล Item No, Location ออกมา ---
+    const scheduleRequest = transaction.request();
+    scheduleRequest.input('scheduleId', sql.Int, scheduleId);
+    scheduleRequest.input('actualQty', sql.Decimal(18, 4), parseFloat(actualQty));
+    scheduleRequest.input('userId', sql.NVarChar, userId);
+
+    const updateScheduleQuery = `
+      UPDATE MC_SCHEDULED_RECEIVES
+      SET 
+        STATUS = 'CONFIRMED',
+        ACTUAL_QTY = @actualQty,
+        RECEIVED_BY_USERID = @userId,
+        CONFIRM_DATETIME = GETDATE()
+      OUTPUT 
+        inserted.ITEM_NO, 
+        inserted.LOCATION_NAME,
+        inserted.ACTUAL_QTY
+      WHERE 
+        SCHEDULE_ID = @scheduleId AND STATUS = 'PENDING';
+    `;
+    
+    const scheduleResult = await scheduleRequest.query(updateScheduleQuery);
+
+    if (scheduleResult.recordset.length === 0) {
+      throw new Error('Schedule not found or already confirmed');
+    }
+
+    const { ITEM_NO, LOCATION_NAME, ACTUAL_QTY } = scheduleResult.recordset[0];
+    
+    // --- Step 2: อัปเดต (หรือเพิ่ม) สต็อกใน MC_INVENTORY_STOCK (Upsert) ---
+    const stockRequest = transaction.request();
+    stockRequest.input('itemNo', sql.NVarChar, ITEM_NO);
+    stockRequest.input('locationName', sql.NVarChar, LOCATION_NAME);
+    stockRequest.input('receivedQty', sql.Decimal(18, 4), ACTUAL_QTY); // ใช้ Qty ที่กรอกจริง
+
+    const mergeStockQuery = `
+      MERGE INTO MC_INVENTORY_STOCK AS target
+      USING (SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME) AS source
+      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      
+      WHEN MATCHED THEN
+        -- ถ้าเจอ Item และ Location นี้: ให้อัปเดต QTY
+        UPDATE SET 
+          QTY = target.QTY + @receivedQty,
+          LAST_UPDATE = GETDATE()
+          
+      WHEN NOT MATCHED THEN
+        -- ถ้าไม่เจอ: ให้เพิ่มแถวใหม่
+        INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
+        VALUES (@itemNo, @locationName, @receivedQty, GETDATE());
+    `;
+
+    await stockRequest.query(mergeStockQuery);
+
+    // --- Step 3: ถ้าทุกอย่างสำเร็จ ให้ Commit Transaction ---
+    await transaction.commit();
+    
+    await logAction('RECEIVE_CONFIRM', scheduleId, 'RECEIVE', `Confirmed schedule ${scheduleId} with QTY ${actualQty}`);
+    res.json({ message: 'Receive confirmed and stock updated successfully' });
+
+  } catch (err) {
+    // --- Step 4: ถ้ามีอะไรพลาด ให้ Rollback ---
+    await transaction.rollback();
+    console.error('Error confirming receive:', err);
+    res.status(500).json({ message: err.message || 'Failed to confirm receive' });
+  }
+});
+
+// 4. API สำหรับย้ายของ (Transfer Stock)
+app.post('/api/inventory/transfer', verifyToken, requireReceiveRole, async (req, res) => {
+  const { itemNo, locationFrom, locationTo, transferQty } = req.body;
+  const userId = req.user.userid;
+
+  if (!itemNo || !locationFrom || !locationTo || !transferQty || transferQty <= 0) {
+    return res.status(400).json({ message: 'Missing fields or invalid transfer Qty' });
+  }
+  if (locationFrom === locationTo) {
+    return res.status(400).json({ message: 'From and To locations cannot be the same' });
+  }
+
+  const pool = await poolPromise;
+  // --- ADDED VALIDATION ---
+  try {
+    const stockCheckRequest = pool.request();
+    stockCheckRequest.input('itemNo', sql.NVarChar, itemNo);
+    // เช็คว่ามี Item นี้ในสต็อก (ที่ใดก็ได้) อย่างน้อย 1 แถวหรือไม่
+    const stockResult = await stockCheckRequest.query('SELECT 1 FROM MC_INVENTORY_STOCK WHERE ITEM_NO = @itemNo');
+    
+    if (stockResult.recordset.length === 0) {
+      return res.status(404).json({ message: 'ไม่พบ Item นี้ในสต็อก (MC_INVENTORY_STOCK), ไม่สามารถ Transfer ได้' });
+    }
+
+    const transaction = pool.transaction();
+    await transaction.begin();
+    
+    const qty = parseFloat(transferQty);
+
+    // --- Step 1: ลด QTY จาก Location ต้นทาง (Upsert ด้วย MERGE) ---
+    const fromRequest = transaction.request();
+    fromRequest.input('itemNo', sql.NVarChar, itemNo);
+    fromRequest.input('locationFrom', sql.NVarChar, locationFrom);
+    fromRequest.input('transferQty', sql.Decimal(18, 4), qty);
+    
+    const mergeFromQuery = `
+      MERGE INTO MC_INVENTORY_STOCK AS target
+      USING (SELECT @itemNo AS ITEM_NO, @locationFrom AS LOCATION_NAME) AS source
+      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      WHEN MATCHED THEN
+          UPDATE SET 
+            QTY = target.QTY - @transferQty, 
+            LAST_UPDATE = GETDATE()
+      WHEN NOT MATCHED THEN
+          INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
+          VALUES (@itemNo, @locationFrom, -@transferQty, GETDATE());
+    `;
+    await fromRequest.query(mergeFromQuery);
+
+    // --- Step 2: เพิ่ม QTY ไปยัง Location ปลายทาง (Upsert ด้วย MERGE) ---
+    const toRequest = transaction.request();
+    toRequest.input('itemNo', sql.NVarChar, itemNo);
+    toRequest.input('locationTo', sql.NVarChar, locationTo);
+    toRequest.input('transferQty', sql.Decimal(18, 4), qty);
+
+    const mergeToQuery = `
+      MERGE INTO MC_INVENTORY_STOCK AS target
+      USING (SELECT @itemNo AS ITEM_NO, @locationTo AS LOCATION_NAME) AS source
+      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      WHEN MATCHED THEN
+          UPDATE SET 
+            QTY = target.QTY + @transferQty, 
+            LAST_UPDATE = GETDATE()
+      WHEN NOT MATCHED THEN
+          INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
+          VALUES (@itemNo, @locationTo, @transferQty, GETDATE());
+    `;
+    await toRequest.query(mergeToQuery);
+
+    // --- Step 3: Commit ---
+    await transaction.commit();
+    await logAction('TRANSFER', itemNo, 'INVENTORY', `...`);
+    res.json({ message: 'Stock transferred successfully' });
+
+  } catch (err) {
+    // await transaction.rollback(); // (ถ้า transaction ถูกสร้างแล้ว)
+    console.error('Error transferring stock:', err);
+    res.status(500).json({ message: err.message || 'Failed to transfer stock' });
+  }
+});
+
+// Check if Item No exists in Master
+app.get('/api/item-master/check/:itemNo', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const { itemNo } = req.params;
+    const pool = await poolPromise;
+    const request = pool.request();
+    request.input('itemNo', sql.NVarChar, itemNo);
+    
+    const result = await request.query('SELECT ITEM_NO, ITEM_NAME FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
+    
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ message: 'ไม่พบ item no นี้ กรุณาตรวจสอบใหม่อีกครั้ง' });
+    }
+    
+    // ส่งชื่อ Item กลับไปด้วย
+    res.json(result.recordset[0]); // { ITEM_NO: "...", ITEM_NAME: "..." }
+    
+  } catch (err) {
+    console.error('Error checking item master:', err);
+    res.status(500).json({ message: 'Server error while checking item' });
+  }
+});
+
+// Get stock levels for a specific item
+app.get('/api/inventory/stock/:itemNo', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const { itemNo } = req.params;
+    const pool = await poolPromise;
+    const request = pool.request();
+    request.input('itemNo', sql.NVarChar, itemNo);
+
+    // Query เฉพาะตาราง Stock
+    const result = await request.query('SELECT LOCATION_NAME, QTY FROM MC_INVENTORY_STOCK WHERE ITEM_NO = @itemNo AND QTY != 0');
+    
+    if (result.recordset.length === 0) {
+      return res.status(404).json({ message: 'ไม่พบ Item นี้ในสต็อก (หรือ QTY เป็น 0)' });
+    }
+    
+    // ส่งกลับเป็น Array [ { LOCATION_NAME: "F6", QTY: 100 }, ... ]
+    res.json(result.recordset); 
+    
+  } catch (err) {
+    console.error('Error checking item stock:', err);
+    res.status(500).json({ message: 'Server error while checking stock' });
+  }
+});
+
+// 5. API สำหรับหน้า Stock View (แสดง Card)
+app.get('/api/inventory/stock', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const { search = '', location = 'ALL' } = req.query; // รับค่า search/location
+
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    // สร้างเงื่อนไข WHERE ตามสิทธิ์
+    const whereConditions = [];
+
+    // กรองสิทธิ์ตาม Division ที่ User ถืออยู่ (เหมือนเดิม)
+    if (req.user.role !== 'ADMIN') {
+      whereConditions.push(`i.division = @userDivision`); 
+      request.input('userDivision', sql.NVarChar, req.user.division);
+    }
+    
+    // --- เพิ่ม: กรองตาม Location (ถ้าไม่ใช่ 'ALL') ---
+    if (location !== 'ALL') {
+      whereConditions.push(`s.LOCATION_NAME = @location`);
+      request.input('location', sql.NVarChar, location);
+    }
+    
+    // --- เพิ่ม: กรองตาม Search Term ---
+    if (search) {
+      whereConditions.push(`(s.ITEM_NO LIKE @searchTerm OR i.ITEM_NAME LIKE @searchTerm)`);
+      request.input('searchTerm', sql.NVarChar, `%${search}%`);
+    }
+
+    // รวม WHERE ทั้งหมด
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+    
+    const query = `
+      SELECT 
+        s.ITEM_NO, 
+        i.ITEM_NAME, 
+        s.LOCATION_NAME, 
+        s.QTY
+      FROM MC_INVENTORY_STOCK s
+      LEFT JOIN MC_ITEM_MASTER i ON s.ITEM_NO = i.ITEM_NO
+      ${whereClause}
+      ORDER BY s.ITEM_NO, s.LOCATION_NAME;
+    `;
+    
+    const result = await request.query(query);
+    res.json(result.recordset);
+
+  } catch (err) {
+    console.error('Error fetching inventory stock:', err);
+    res.status(500).json({ message: 'Failed to fetch inventory stock' });
+  }
+});
+
+app.get('/api/receive/pending-count', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+    
+    const whereConditions = ["STATUS = 'PENDING'"];
+
+    if (req.user.role !== 'ADMIN') {
+      whereConditions.push(`DIVISION_SCRIPT = @userDivision`);
+      request.input('userDivision', sql.NVarChar, req.user.division);
+    }
+    
+    const query = `
+      SELECT COUNT(*) AS pendingCount
+      FROM MC_SCHEDULED_RECEIVES
+      WHERE ${whereConditions.join(' AND ')};
+    `;
+    
+    const result = await request.query(query);
+    res.json(result.recordset[0]); // { pendingCount: 5 }
+
+  } catch (err) {
+    console.error('Error fetching pending count:', err);
+    res.status(500).json({ message: 'Failed to fetch pending count' });
+  }
+});
+
+// ========================================================= //
+
+
+// Fetch itemmaster data
+app.get('/api/item-master', verifyToken, async (req, res) => {
+  try {
+    // --- 1. รับค่า Parameter จาก Query String (ฝั่ง Client) ---
+    const { 
+      page = 1, 
+      limit = 20, 
+      search = '', 
+      sortKey = 'ITEM_NO', // ค่าเริ่มต้น
+      sortDir = 'asc'      // ค่าเริ่มต้น
+    } = req.query;
+
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    // --- 2. การตั้งค่าตัวแปรสำหรับ SQL ---
+    const pageInt = parseInt(page, 10);
+    const limitInt = parseInt(limit, 10);
+    const offset = (pageInt - 1) * limitInt;
+
+    const allowedSortKeys = [
+      'ITEM_NO', 'ITEM_NAME', 'SPEC', 'DRWG', 'ACCOUNT', 
+      'VENDOR_CODE', 'VENDOR_NAME', 'PUR_LEAD_TIME', 'MAKER_NAME', 'REMARK', 'DIVISION_SCRIPT'
+    ];
+    
+    // ถ้า sortKey ที่ส่งมาไม่อยู่ใน list, ให้ใช้ค่า default
+    const safeSortKey = allowedSortKeys.includes(sortKey) ? sortKey : 'ITEM_NO';
+    const safeSortDir = ['asc', 'desc'].includes(sortDir.toLowerCase()) ? sortDir.toLowerCase() : 'asc';
+    
+    // --- 3. สร้าง WHERE Clause แบบไดนามิก ---
+    const whereConditions = [];
+    
+    // 3.1: เงื่อนไขการค้นหา (Search)
+    if (search) {
+      whereConditions.push(`
+        (
+          r.ITEM_NO LIKE @searchTerm OR
+          r.ITEM_NAME LIKE @searchTerm OR
+          r.SPEC LIKE @searchTerm OR
+          r.DRWG LIKE @searchTerm OR
+          r.ACCOUNT LIKE @searchTerm OR
+          r.VENDOR_CODE LIKE @searchTerm OR
+          r.VENDOR_NAME LIKE @searchTerm OR
+          r.MAKER_NAME LIKE @searchTerm
+        )
+      `);
+      request.input('searchTerm', sql.NVarChar, `%${search}%`);
+    }
+
+    // 3.2: เงื่อนไขตามสิทธิ์ (Role/Division/Org)
+    // (แก้ไข Logic ที่พังในโค้ดเดิมของคุณ)
+    if (req.user.role !== 'ADMIN') {
+      if (req.user.division === 'M/P 1') {
+        whereConditions.push(`r.division = 'M/P 1'`); // สมมติว่ามีคอลัมน์ 'division'
+      } else if (req.user.division === 'M/P 2') {
+        whereConditions.push(`r.division = 'M/P 2'`); // สมมติว่ามีคอลัมน์ 'division'
+        
+        // เพิ่ม Logic การกรอง 'org' ที่ขาดหายไป
+        const userOrgs = req.user.org.split(',').map(org => org.trim()).filter(Boolean);
+        if (userOrgs.length > 0) {
+          const orgParams = userOrgs.map((org, index) => `@org${index}`);
+          whereConditions.push(`r.ORGN_CODE IN (${orgParams.join(',')})`); // สมมติว่าเช็คจาก ORGN_CODE
+          userOrgs.forEach((org, index) => {
+            request.input(`org${index}`, sql.VarChar, org);
+          });
+        }
+      } else if (req.user.division === 'Common') {
+        // เพิ่ม Logic การกรอง 'org' ที่ขาดหายไป
+        const userOrgs = req.user.org.split(',').map(org => org.trim()).filter(Boolean);
+        if (userOrgs.length > 0) {
+          const orgParams = userOrgs.map((org, index) => `@org${index}`);
+          whereConditions.push(`r.ORGN_CODE IN (${orgParams.join(',')})`); // สมมติว่าเช็คจาก ORGN_CODE
+          userOrgs.forEach((org, index) => {
+            request.input(`org${index}`, sql.VarChar, org);
+          });
+        }
+      } else {
+         // User ทั่วไปที่ไม่ใช่ ADMIN แต่ไม่มี Division พิเศษ? (ใส่ Logic ของคุณ)
+         // อาจจะ Block เลย หรือกรองตาม userid
+         // whereConditions.push(`r.CREATED_BY = @userid`);
+         // request.input('userid', sql.VarChar, req.user.userid);
+      }
+    }
+
+    // รวม WHERE ทั้งหมด
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    // --- 4. สร้าง Final Query ---
+    // ใช้ COUNT(*) OVER() เพื่อเอาจำนวนทั้งหมด (TotalCount) มาด้วยใน query เดียว
+    // ใช้ OFFSET ... FETCH ... เพื่อแบ่งหน้า
+    const query = `
+      SELECT 
+        r.ITEM_NO, 
+        r.ITEM_NAME, 
+        r.SPEC, 
+        r.DRWG, 
+        r.ACCOUNT, 
+        r.VENDOR_CODE, 
+        r.VENDOR_NAME,
+        r.PUR_LEAD_TIME,
+        r.MAKER_NAME,
+        r.REMARK,
+        r.DIVISION_SCRIPT,
+        COUNT(*) OVER() AS TotalCount 
+      FROM MC_ITEM_MASTER r
+      ${whereClause}
+      ORDER BY ${safeSortKey} ${safeSortDir}
+      OFFSET @offset ROWS
+      FETCH NEXT @limit ROWS ONLY;
+    `;
+
+    request.input('offset', sql.Int, offset);
+    request.input('limit', sql.Int, limitInt);
+    
+    // --- 5. สั่ง Query และส่งผลลัพธ์ ---
+    const result = await request.query(query);
+    
+    // ดึง TotalCount จากแถวแรก (ถ้ามี)
+    const totalCount = result.recordset.length > 0 ? result.recordset[0].TotalCount : 0;
+    
+    res.json({
+      data: result.recordset,
+      totalCount: totalCount
+    });
+
+  } catch (err) {
+    console.error('Error fetching item master data:', err);
+    res.status(500).json({ message: 'Failed to fetch item master data' });
   }
 });
 
@@ -761,592 +1157,14 @@ app.get('/api/userall', verifyToken, async (req, res) => {
 });
 
 
-// ========== ITEM MASTER ROUTES ==========
-// ADD ITEM POST
-app.post('/api/add_item_master', verifyToken, requireADMIN, async (req, res) => {
-  try {
-    const {
-      item_no,
-      card_id,
-      date,
-      vendor_code,
-      vendor_name,
-      item_name,
-      spec,
-      drwg,
-      account,
-      unit_price,
-      currency,
-      safety_stock,
-      on_hand,
-      pur_lead_time,
-      division,
-      issued_by
-    } = req.body;
-
-    if (!item_no || !division || !issued_by) {
-      return res.status(400).json({
-        message: 'Required fields are missing: item_no, division, issued_by'
-      });
-    }
-
-    const upperItemNo = item_no.toUpperCase();
-    const pool = await poolPromise;
-
-    // ตรวจสอบ item ซ้ำ
-    const checkRequest = pool.request();
-    const result = await checkRequest
-      .input('item_no', sql.NVarChar, upperItemNo)
-      .query('SELECT COUNT(*) AS count FROM ItemMaster WHERE item_no = @item_no');
-
-    if (result.recordset[0].count > 0) {
-      return res.status(409).json({
-        message: `Item No. ${upperItemNo} already exists.`
-      });
-    }
-
-    // Insert ข้อมูลใหม่
-    const insertRequest = pool.request();
-    await insertRequest
-      .input('item_no', sql.NVarChar, upperItemNo)
-      .input('card_id', sql.NVarChar, card_id || null)
-      .input('date', sql.Date, date ? new Date(date) : null)
-      .input('vendor_code', sql.NVarChar, vendor_code || null)
-      .input('vendor_name', sql.NVarChar, vendor_name || null)
-      .input('item_name', sql.NVarChar, item_name || null)
-      .input('spec', sql.NVarChar, spec || null)
-      .input('drwg', sql.NVarChar, drwg || null)
-      .input('account', sql.NVarChar, account || null)
-      .input('unit_price', sql.Decimal(18, 4), unit_price ? parseFloat(unit_price) : null)
-      .input('currency', sql.NVarChar, currency || null)
-      .input('safety_stock', sql.Int, safety_stock ? parseInt(safety_stock) : null)
-      .input('on_hand', sql.Int, on_hand ? parseInt(on_hand) : null)
-      .input('pur_lead_time', sql.Int, pur_lead_time ? parseInt(pur_lead_time) : null)
-      .input('division', sql.NVarChar, division)
-      .input('issued_by', sql.NVarChar, issued_by)
-      .query(`
-        INSERT INTO ItemMaster (
-          item_no, card_id, date, vendor_code, vendor_name, item_name, spec, drwg,
-          account, unit_price, currency, safety_stock, on_hand, pur_lead_time,
-          division, add_item_master_by, created_at, updated_at
-        )
-        VALUES (
-          @item_no, @card_id, @date, @vendor_code, @vendor_name, @item_name, @spec, @drwg,
-          @account, @unit_price, @currency, @safety_stock, @on_hand, @pur_lead_time,
-          @division, @issued_by, GETDATE(), GETDATE()
-        )
-      `);
-
-    await logAction('ADD_ITEM_MASTER', upperItemNo, 'ITEM', `Added item ${upperItemNo} by ${issued_by}`);
-    return res.status(201).json({ message: 'Item Master created successfully', item_no: upperItemNo });
-  } catch (err) {
-    console.error('Error creating item master:', err);
-    await logAction('ADD_ITEM_MASTER_ERROR', null, 'SYSTEM', `Error: ${err.message}`);
-    return res.status(500).json({ message: 'Failed to create item master', error: err.message });
-  }
-});
-
-// view item master
-app.get('/api/view_item_master', verifyToken, async (req, res) => {
-  try {
-    const pool = await poolPromise;
-    const request = pool.request();
-
-    let query = `
-      SELECT TOP(100)
-        item_no, 
-        card_id, 
-        date, 
-        vendor_code, 
-        vendor_name, 
-        item_name, 
-        spec,
-        drwg,
-        account,
-        unit_price,
-        currency, 
-        safety_stock,
-        on_hand,
-        pur_lead_time,
-        division,
-        add_item_master_by,
-        created_at
-      FROM ItemMaster
-    `;
-
-    // กรองตามบทบาทผู้ใช้
-    if (req.user.role === 'ADMIN') {
-      query += ' ORDER BY created_at DESC';
-    } else if (req.user.division === 'M/P 1') {
-      query += " WHERE division = 'M/P 1' ORDER BY created_at DESC";
-    } else if (req.user.division === 'M/P 2') {
-      query += " WHERE division = 'M/P 2' ORDER BY created_at DESC";
-    } else {
-      // สำหรับ user ทั่วไป: แสดงเฉพาะของตัวเอง
-      query += " WHERE issued_by = @issued_by ORDER BY created_at DESC";
-      request.input('issued_by', sql.NVarChar, req.user.name);
-    }
-
-    const result = await request.query(query);
-    return res.json(result.recordset);
-  } catch (err) {
-    console.error('Error fetching item master data:', err);
-    return res.status(500).json({ message: 'Failed to fetch item master data' });
-  }
-});
-
-app.put('/api/update_item_master/:item_no', verifyToken, requireADMIN, async (req, res) => {
-  try {
-    const { item_no } = req.params;
-
-    const {
-      card_id,
-      date,
-      vendor_code,
-      vendor_name,
-      item_name,
-      spec,
-      drwg,
-      account,
-      unit_price,
-      currency,
-      safety_stock,
-      on_hand,
-      pur_lead_time,
-      division
-    } = req.body;
-
-    if (!item_no) {
-      return res.status(400).json({ message: 'Item No is required' });
-    }
-
-    const pool = await poolPromise;
-
-    // --- 1. ตรวจสอบว่า item มีอยู่จริง ---
-    const checkRequest = pool.request(); // สร้าง request ใหม่
-    const checkResult = await checkRequest
-      .input('item_no', sql.NVarChar, item_no)
-      .query('SELECT COUNT(*) AS count FROM ItemMaster WHERE item_no = @item_no');
-
-    if (checkResult.recordset[0].count === 0) {
-      return res.status(404).json({ message: 'Item not found' });
-    }
-
-    // --- 2. อัปเดตข้อมูล ---
-    const updateRequest = pool.request(); // สร้าง request ใหม่อีกตัว
-    const fields = [];
-    const inputs = {
-      item_no: sql.NVarChar,
-      card_id: sql.NVarChar,
-      date: sql.Date,
-      vendor_code: sql.NVarChar,
-      vendor_name: sql.NVarChar,
-      item_name: sql.NVarChar,
-      spec: sql.NVarChar,
-      drwg: sql.NVarChar,
-      account: sql.NVarChar,
-      unit_price: sql.Decimal(18, 4),
-      currency: sql.NVarChar,
-      safety_stock: sql.Int,
-      on_hand: sql.Int,
-      pur_lead_time: sql.Int,
-      division: sql.NVarChar
-    };
-
-    for (const [key, type] of Object.entries(inputs)) {
-      if (req.body[key] !== undefined && req.body[key] !== null) {
-        fields.push(`${key} = @${key}`);
-        let value = req.body[key];
-
-        if (type === sql.Date && value) value = new Date(value);
-        if (type === sql.Decimal(18, 4) && value) value = parseFloat(value);
-        if (type === sql.Int && value) value = parseInt(value, 10);
-
-        updateRequest.input(key, type, value); // ใช้ updateRequest
-      }
-    }
-
-    if (fields.length === 0) {
-      return res.status(400).json({ message: 'No fields to update' });
-    }
-
-    fields.push('updated_at = GETDATE()');
-
-    const query = `
-      UPDATE ItemMaster
-      SET ${fields.join(', ')}
-      WHERE item_no = @item_no
-    `;
-
-    await updateRequest.query(query); // ใช้ updateRequest
-
-    // --- 3. บันทึก log ---
-    const logRequest = pool.request(); // อีก request สำหรับ log
-    await logRequest
-      .input('action', sql.NVarChar, 'UPDATE_ITEM_MASTER')
-      .input('targetId', sql.NVarChar, item_no)
-      .input('targetType', sql.NVarChar, 'ITEM')
-      .input('comment', sql.NVarChar, `Updated item ${item_no} by ${req.user.name}`)
-      .query(`
-        INSERT INTO logs (action, target_id, target_type, comment, created_at)
-        VALUES (@action, @targetId, @targetType, @comment, GETDATE())
-      `);
-
-    return res.json({ message: 'Item updated successfully', item_no });
-  } catch (err) {
-    console.error('Error updating item master:', err);
-    return res.status(500).json({ message: 'Failed to update item' });
-  }
-});
-
-// ========== RECIEVE ROUTES ==========
-app.post('/api/update_item_balance', verifyToken, requireADMIN, async (req, res) => {
-  const { itemNo, iqc, onStock, active, cabinetId_IQC, cabinetId_OnStock, cabinetId_Active } = req.body;
-
-  // Validate
-  if (![iqc, onStock, active].every(x => Number.isInteger(x) && x >= 0)) {
-    return res.status(400).json({ message: 'จำนวนต้องเป็นตัวเลขและไม่น้อยกว่า 0' });
-  }
-
-  if (iqc + onStock + active === 0) {
-    return res.status(400).json({ message: 'ต้องมีจำนวนอย่างน้อย 1' });
-  }
-
-  try {
-    const pool = await poolPromise;
-
-    // ตรวจสอบว่า item มีอยู่
-    const itemCheck = await pool.request()
-      .input('itemNo', sql.VarChar, itemNo)
-      .query('SELECT item_no FROM ItemMaster WHERE item_no = @itemNo');
-
-    if (itemCheck.recordset.length === 0) {
-      return res.status(404).json({ message: 'ไม่พบ Item' });
-    }
-
-    // อัปเดตหรือเพิ่มใน Items table (สมมติว่ามีตารางนี้)
-    await pool.request()
-      .input('itemNo', sql.VarChar, itemNo)
-      .input('iqc', sql.Int, iqc)
-      .input('onStock', sql.Int, onStock)
-      .input('active', sql.Int, active)
-      .input('cabinetId_IQC', sql.Int, cabinetId_IQC)
-      .input('cabinetId_OnStock', sql.Int, cabinetId_OnStock)
-      .input('cabinetId_Active', sql.Int, cabinetId_Active)
-      .query(`
-        IF EXISTS (SELECT 1 FROM Items WHERE ItemNo = @itemNo)
-          UPDATE Items SET
-            IQC = IQC + @iqc,
-            OnStock = OnStock + @onStock,
-            Active = Active + @active,
-            CabinetID_IQC = ISNULL(@cabinetId_IQC, CabinetID_IQC),
-            CabinetID_OnStock = ISNULL(@cabinetId_OnStock, CabinetID_OnStock),
-            CabinetID_Active = ISNULL(@cabinetId_Active, CabinetID_Active)
-          WHERE ItemNo = @itemNo
-        ELSE
-          INSERT INTO Items (ItemNo, IQC, OnStock, Active, CabinetID_IQC, CabinetID_OnStock, CabinetID_Active)
-          VALUES (@itemNo, @iqc, @onStock, @active, @cabinetId_IQC, @cabinetId_OnStock, @cabinetId_Active)
-      `);
-
-    await logAction('RECEIVE_ITEM', null, 'ITEM', `รับของ: ${itemNo}, IQC=${iqc}, OnStock=${onStock}, Active=${active}`);
-
-    res.json({ success: true, message: 'รับของสำเร็จ' });
-  } catch (err) {
-    console.error('Error:', err);
-    res.status(500).json({ message: 'บันทึกไม่สำเร็จ' });
-  }
-});
-
-// GET /api/item_balance/:itemNo
-app.get('/api/item_balance/:itemNo', verifyToken, requireCommon, async (req, res) => {
-  const { itemNo } = req.params;
-  try {
-    const pool = await poolPromise;
-    const result = await pool.request()
-      .input('itemNo', sql.VarChar, itemNo)
-      .query(`
-        SELECT 
-          i.IQC,
-          i.OnStock,
-          i.Active,
-          im.safety_stock,
-          cab_iqc.CabinetName AS CabinetName_IQC,
-          cab_iqc.CabinetLevel AS CabinetLevel_IQC,
-          cab_iqc.CabinetNo AS CabinetNo_IQC,
-          cab_onstock.CabinetName AS CabinetName_OnStock,
-          cab_onstock.CabinetLevel AS CabinetLevel_OnStock,
-          cab_onstock.CabinetNo AS CabinetNo_OnStock,
-          cab_active.CabinetName AS CabinetName_Active,
-          cab_active.CabinetLevel AS CabinetLevel_Active,
-          cab_active.CabinetNo AS CabinetNo_Active
-        FROM Items i
-        JOIN ItemMaster im ON i.ItemNo = im.item_no
-        LEFT JOIN Cabinets cab_iqc ON cab_iqc.CabinetID = i.CabinetID_IQC
-        LEFT JOIN Cabinets cab_onstock ON cab_onstock.CabinetID = i.CabinetID_OnStock
-        LEFT JOIN Cabinets cab_active ON cab_active.CabinetID = i.CabinetID_Active
-        WHERE i.ItemNo = @itemNo
-      `);
-
-    if (result.recordset.length === 0) {
-      return res.json({ success: true, data: null }); // ไม่มีข้อมูลก็ไม่ผิด
-    }
-
-    res.json({ success: true, data: result.recordset[0] });
-  } catch (error) {
-    console.error('Error fetching item balance:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
-  }
-});
-
-// ========== AUDIT LOG ROUTES ==========
-app.get('/api/audit_logs/:targetType/:targetId', verifyToken, async (req, res) => {
-  try {
-    const { targetType, targetId } = req.params;
-    const pool = await poolPromise;
-    const request = pool.request();
-
-    const result = await request
-      .input('targetType', sql.NVarChar, targetType)
-      .input('targetId', sql.NVarChar, targetId)
-      .query(`
-        SELECT 
-          action,
-          comment,
-          created_at,
-          LTRIM(RIGHT(comment, CHARINDEX(' ', REVERSE(comment)) - 1)) AS [user]
-        FROM logs 
-        WHERE target_type = @targetType 
-          AND target_id = @targetId
-        ORDER BY created_at DESC
-      `);
-
-    res.json(result.recordset);
-  } catch (err) {
-    console.error('Error fetching audit logs:', err);
-    res.status(500).json({ message: 'Failed to fetch audit logs' });
-  }
-});
-
-// ========== CABINET ROUTES ==========
-// GET /api/cabinets - Fetch all cabinets
-app.get('/api/cabinets', verifyToken, requireCommon, async (req, res) => {
-  try {
-    const pool = await poolPromise;
-    const result = await pool.request().query(`
-      SELECT CabinetID, CabinetName, CabinetLevel, CabinetNo 
-      FROM [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets]
-      ORDER BY CabinetName, CabinetLevel, CabinetNo
-    `);
-    await logAction('VIEW_CABINETS', null, 'CABINETS', `User ${req.user.username} viewed all cabinets`);
-    res.json({ success: true, data: result.recordset });
-  } catch (error) {
-    console.error('Error fetching cabinets:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// POST /api/cabinets - Add new cabinet
-app.post('/api/cabinets', verifyToken, requireADMIN, async (req, res) => {
-  const { cabinetName, cabinetLevel, cabinetNo } = req.body;
-  try {
-    const pool = await poolPromise;
-
-    // Check for duplicates
-    const existing = await pool.request()
-      .input('cabinetName', sql.NVarChar, cabinetName)
-      .input('cabinetLevel', sql.NVarChar, cabinetLevel)
-      .input('cabinetNo', sql.NVarChar, cabinetNo)
-      .query(`
-        SELECT * FROM [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets]
-        WHERE CabinetName = @cabinetName 
-        AND CabinetLevel = @cabinetLevel 
-        AND CabinetNo = @cabinetNo
-      `);
-
-    if (existing.recordset.length > 0) {
-      return res.json({ success: false, message: 'Cabinet already exists' });
-    }
-
-    // Insert new cabinet
-    const insertResult = await pool.request()
-      .input('cabinetName', sql.NVarChar, cabinetName)
-      .input('cabinetLevel', sql.NVarChar, cabinetLevel)
-      .input('cabinetNo', sql.NVarChar, cabinetNo)
-      .query(`
-        INSERT INTO [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets] 
-        (CabinetName, CabinetLevel, CabinetNo)
-        OUTPUT INSERTED.CabinetID
-        VALUES (@cabinetName, @cabinetLevel, @cabinetNo)
-      `);
-
-    const cabinetId = insertResult.recordset[0]?.CabinetID;
-    await logAction('ADD_CABINET', cabinetId, 'CABINET', `User ${req.user.username} added cabinet ${cabinetName}, Level: ${cabinetLevel}, No: ${cabinetNo}`);
-
-    res.json({ success: true, message: 'Cabinet added successfully' });
-  } catch (error) {
-    console.error('Error adding cabinet:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// GET /api/cabinets/:cabinetId/items - Fetch items in a cabinet
-app.get('/api/cabinets/:cabinetId/items', verifyToken, requireCommon, async (req, res) => {
-  const { cabinetId } = req.params;
-  try {
-    const pool = await poolPromise;
-    const result = await pool.request()
-      .input('cabinetId', sql.Int, cabinetId)
-      .query(`
-        SELECT 
-          'IQC' AS LocationZone,
-          i.ItemNo,
-          im.item_name AS ItemName,
-          i.IQC AS Quantity,
-          c.CabinetName,
-          c.CabinetLevel,
-          c.CabinetNo
-        FROM Items i
-        JOIN ItemMaster im ON i.ItemNo = im.item_no
-        JOIN Cabinets c ON c.CabinetID = i.CabinetID_IQC
-        WHERE i.CabinetID_IQC = @cabinetId AND i.IQC > 0
-
-        UNION ALL
-
-        SELECT 
-          'OnStock' AS LocationZone,
-          i.ItemNo,
-          im.item_name AS ItemName,
-          i.OnStock AS Quantity,
-          c.CabinetName,
-          c.CabinetLevel,
-          c.CabinetNo
-        FROM Items i
-        JOIN ItemMaster im ON i.ItemNo = im.item_no
-        JOIN Cabinets c ON c.CabinetID = i.CabinetID_OnStock
-        WHERE i.CabinetID_OnStock = @cabinetId AND i.OnStock > 0
-
-        UNION ALL
-
-        SELECT 
-          'Active' AS LocationZone,
-          i.ItemNo,
-          im.item_name AS ItemName,
-          i.Active AS Quantity,
-          c.CabinetName,
-          c.CabinetLevel,
-          c.CabinetNo
-        FROM Items i
-        JOIN ItemMaster im ON i.ItemNo = im.item_no
-        JOIN Cabinets c ON c.CabinetID = i.CabinetID_Active
-        WHERE i.CabinetID_Active = @cabinetId AND i.Active > 0
-
-        ORDER BY ItemNo, LocationZone
-      `);
-
-    await logAction('VIEW_CABINET_ITEMS', cabinetId, 'CABINET_ITEMS', 
-      `User ${req.user.username} viewed items in cabinet ${cabinetId}`);
-
-    res.json({ success: true, data: result.recordset });
-  } catch (error) {
-    console.error('Error fetching cabinet items:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// DELETE /api/cabinets/:id
-app.delete('/api/cabinets/:id', verifyToken, requireADMIN, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const pool = await poolPromise;
-
-    // ตรวจสอบว่ามี item อยู่หรือไม่
-    const itemCheck = await pool.request()
-      .input('cabinetId', sql.Int, id)
-      .query(`
-        SELECT TOP 1 * FROM Items 
-        WHERE CabinetID_IQC = @cabinetId OR CabinetID_OnStock = @cabinetId OR CabinetID_Active = @cabinetId
-      `);
-
-    if (itemCheck.recordset.length > 0) {
-      return res.json({ success: false, message: 'Cannot delete cabinet with items inside' });
-    }
-
-    const result = await pool.request()
-      .input('id', sql.Int, id)
-      .query(`DELETE FROM [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets] WHERE CabinetID = @id`);
-
-    if (result.rowsAffected[0] === 0) {
-      return res.status(404).json({ success: false, message: 'Cabinet not found' });
-    }
-
-    await logAction('DELETE_CABINET', id, 'CABINET', `User ${req.user.username} deleted cabinet ID: ${id}`);
-    res.json({ success: true, message: 'Cabinet deleted successfully' });
-  } catch (error) {
-    console.error('Error deleting cabinet:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-// PUT /api/cabinets/:id
-app.put('/api/cabinets/:id', verifyToken, requireADMIN, async (req, res) => {
-  const { id } = req.params;
-  const { cabinetName, cabinetLevel, cabinetNo } = req.body;
-
-  try {
-    const pool = await poolPromise;
-
-    // ตรวจสอบว่ามีซ้ำหรือไม่ (ยกเว้นตัวเอง)
-    const existing = await pool.request()
-      .input('cabinetName', sql.NVarChar, cabinetName)
-      .input('cabinetLevel', sql.NVarChar, cabinetLevel)
-      .input('cabinetNo', sql.NVarChar, cabinetNo)
-      .input('id', sql.Int, id)
-      .query(`
-        SELECT * FROM [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets]
-        WHERE CabinetName = @cabinetName 
-          AND CabinetLevel = @cabinetLevel 
-          AND CabinetNo = @cabinetNo
-          AND CabinetID != @id
-      `);
-
-    if (existing.recordset.length > 0) {
-      return res.json({ success: false, message: 'Duplicate cabinet configuration' });
-    }
-
-    const result = await pool.request()
-      .input('id', sql.Int, id)
-      .input('cabinetName', sql.NVarChar, cabinetName)
-      .input('cabinetLevel', sql.NVarChar, cabinetLevel)
-      .input('cabinetNo', sql.NVarChar, cabinetNo)
-      .query(`
-        UPDATE [MECHA_PURCHASE_TOOLING].[dbo].[Cabinets]
-        SET CabinetName = @cabinetName, CabinetLevel = @cabinetLevel, CabinetNo = @cabinetNo
-        WHERE CabinetID = @id
-      `);
-
-    if (result.rowsAffected[0] === 0) {
-      return res.status(404).json({ success: false, message: 'Cabinet not found' });
-    }
-
-    await logAction('EDIT_CABINET', id, 'CABINET', 
-      `User ${req.user.username} edited cabinet ID: ${id} to ${cabinetName}, Level: ${cabinetLevel}, No: ${cabinetNo}`);
-
-    res.json({ success: true, message: 'Cabinet updated successfully' });
-  } catch (error) {
-    console.error('Error updating cabinet:', error);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
-
-
 // ========== REACT ROUTER FALLBACK ==========
-app.get('/MECHATOOLINGPS/*', (req, res) => {
+app.get('/MECHA-MATERIAL-SYSTEM/*', (req, res) => {
   console.log('Serving React app for:', req.path);
   res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
-app.get('/MECHATOOLINGPS', (req, res) => {
-  console.log('Serving React app for root MECHATOOLINGPS');
+app.get('/MECHA-MATERIAL-SYSTEM', (req, res) => {
+  console.log('Serving React app for root DMI');
   res.sendFile(path.join(__dirname, 'build', 'index.html'));
 });
 
