@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Container, Table, Alert, Spinner, Form, InputGroup, Button, Pagination } from 'react-bootstrap';
 import { AlertCircle, ArrowUp, ArrowDown } from 'lucide-react';
-import { apiCall } from '../App';
+import { apiCall } from '../../App';
 
 // Custom Hook สำหรับ Debounce
 const useDebounce = (value, delay) => {
@@ -101,7 +101,6 @@ const ItemMaster = () => {
   const indexOfFirstItem = (currentPage - 1) * itemsPerPage;
   const indexOfLastItem = Math.min(indexOfFirstItem + itemsPerPage, totalCount);
 
-  // (โค้ด generatePaginationItems ของคุณเหมือนเดิม ไม่ต้องแก้)
   const generatePaginationItems = () => {
      const items = [];
      const maxVisiblePages = 5;
