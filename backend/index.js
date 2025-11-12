@@ -70,22 +70,37 @@ const verifyToken = (req, res, next) => {
 };
 
 const requireADMIN = (req, res, next) => {
-  if (req.user.role !== 'ADMIN') {
+  const userRoles = (req.user.role || '').split(',').map(role => role.trim());
+  
+  if (!userRoles.includes('ADMIN')) {
     return res.status(403).json({ message: 'ADMIN role required' });
   }
   next();
 };
 
 const requireCommon = (req, res, next) => {
-  if (!['ADMIN', 'Common', 'IQC'].includes(req.user.role)) {
-    return res.status(403).json({ message: 'ADMIN or ISSUE or IQC role required' });
+  const userRoles = (req.user.role || '').split(',').map(role => role.trim());
+  
+  const hasRequiredRole = userRoles.some(role => 
+    ['ADMIN', 'Common', 'RECEIVE', 'ISSUE'].includes(role)
+  );
+
+  if (!hasRequiredRole) {
+    // (แก้ไข Error message ให้ตรงกับ Role ที่เช็ค)
+    return res.status(403).json({ message: 'ADMIN, Common, RECEIVE or ISSUE role required' });
   }
   next();
 };
 
 // ========== NEW MIDDLEWARE FOR RECEIVE ROLE ========== //
 const requireReceiveRole = (req, res, next) => {
-  if (!['ADMIN', 'RECEIVE'].includes(req.user.role)) {
+  const userRoles = (req.user.role || '').split(',').map(role => role.trim());
+  
+  const hasRequiredRole = userRoles.some(role => 
+    ['ADMIN', 'RECEIVE'].includes(role)
+  );
+
+  if (!hasRequiredRole) {
     return res.status(403).json({ message: 'ADMIN or RECEIVE role required' });
   }
   next();
@@ -93,7 +108,6 @@ const requireReceiveRole = (req, res, next) => {
 // =================================================== //
 
 // Log action to the database
-// ... (ฟังก์ชัน logAction ของคุณเหมือนเดิม) ...
 const logAction = async (action, targetId, targetType, comment) => {
   try {
     if (!action || !targetType) {
@@ -281,7 +295,7 @@ app.post('/api/login_rfid', async (req, res) => {
 
     const result = await request
       .input('userid', sql.VarChar, userid)
-      .query('SELECT * FROM Users WHERE userid = @userid');
+      .query('SELECT * FROM Users WHERE userid = @userid'); // <-- SELECT * เอามาหมดอยู่แล้ว
 
     if (result.recordset.length === 0) {
       await logAction('LOGIN_ATTEMPT', userid, 'USER', `Failed login for userid: ${userid}`);
@@ -291,7 +305,12 @@ app.post('/api/login_rfid', async (req, res) => {
     const user = result.recordset[0];
 
     const token = jwt.sign(
-      { userid: user.userid, role: user.role, name: user.name,},
+      { 
+        userid: user.userid, 
+        role: user.role, 
+        name: user.name, 
+        division: user.division // <-- ✅ เพิ่ม division ตรงนี้
+      },
       JWT_SECRET,
       { expiresIn: '24h' }
     );
@@ -300,7 +319,12 @@ app.post('/api/login_rfid', async (req, res) => {
 
     res.json({
       token,
-      user: { userid: user.userid, name: user.name, role: user.role},
+      user: { 
+        userid: user.userid, 
+        name: user.name, 
+        role: user.role,
+        division: user.division // (เพิ่มตรงนี้ด้วยก็ได้ client จะได้เห็น)
+      },
     });
   } catch (err) {
     console.error('Login error:', err);
@@ -527,40 +551,48 @@ app.post('/api/change-password', verifyToken, async (req, res) => {
 // ========== NEW API ROUTES FOR RECEIVE & INVENTORY ========== //
 
 app.post('/api/inventory/direct-receive', verifyToken, requireReceiveRole, async (req, res) => {
-  const { itemNo, location, actualQty } = req.body;
+  // 1. รับค่าใหม่
+  const { itemNo, locationName, subLocation, actualQty } = req.body;
   const userId = req.user.userid;
 
-  if (!itemNo || !location || !actualQty || actualQty <= 0) {
-    return res.status(400).json({ message: 'Item No, Location, and a valid Qty are required' });
+  // 2. Validate
+  if (!itemNo || !locationName || !actualQty || actualQty <= 0) {
+    return res.status(400).json({ message: 'Item No, Location, Sub Location, and a valid Qty are required' });
   }
 
   const pool = await poolPromise;
   
-  // --- VALIDATION ---
+  // --- VALIDATION (เช็ค Item Master) ---
   try {
     const itemCheckRequest = pool.request();
     itemCheckRequest.input('itemNo', sql.NVarChar, itemNo);
     const itemResult = await itemCheckRequest.query('SELECT ITEM_NO FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
     
     if (itemResult.recordset.length === 0) {
-      // นี่คือ Error ที่คุณขอ
       return res.status(404).json({ message: 'ไม่พบ item no นี้ใน Master กรุณาตรวจสอบใหม่อีกครั้ง' });
     }
 
+    // --- เริ่ม Transaction ---
     const transaction = pool.transaction();
     await transaction.begin();
     
-    // (ส่วนที่เหลือของ try block... MERGE query)
     const stockRequest = transaction.request();
     stockRequest.input('itemNo', sql.NVarChar, itemNo);
-    stockRequest.input('locationName', sql.NVarChar, location);
+    stockRequest.input('locationName', sql.NVarChar, locationName);
+    stockRequest.input('subLocation', sql.NVarChar, subLocation); // <-- 3. เพิ่ม
     stockRequest.input('receivedQty', sql.Decimal(18, 4), parseFloat(actualQty));
 
-    // ใช้ MERGE (Upsert) เพื่ออัปเดตสต็อกทันที
+    // 4. อัปเกรด MERGE Query
     const mergeStockQuery = `
       MERGE INTO MC_INVENTORY_STOCK AS target
-      USING (SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME) AS source
-      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      USING (
+        SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME, @subLocation AS SUB_LOCATION
+      ) AS source
+      ON (
+        target.ITEM_NO = source.ITEM_NO AND 
+        target.LOCATION_NAME = source.LOCATION_NAME AND
+        ISNULL(target.SUB_LOCATION, '') = ISNULL(source.SUB_LOCATION, '')
+      )
       
       WHEN MATCHED THEN
         UPDATE SET 
@@ -568,19 +600,19 @@ app.post('/api/inventory/direct-receive', verifyToken, requireReceiveRole, async
           LAST_UPDATE = GETDATE()
           
       WHEN NOT MATCHED THEN
-        INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
-        VALUES (@itemNo, @locationName, @receivedQty, GETDATE());
+        INSERT (ITEM_NO, LOCATION_NAME, SUB_LOCATION, QTY, LAST_UPDATE) -- <-- 5. เพิ่ม
+        VALUES (@itemNo, @locationName, @subLocation, @receivedQty, GETDATE()); -- <-- 5. เพิ่ม
     `;
 
     await stockRequest.query(mergeStockQuery);
     
     await transaction.commit();
-    await logAction('DIRECT_RECEIVE', itemNo, 'INVENTORY', `Direct received ${actualQty} of ${itemNo} to ${location} by ${userId}`);
+    await logAction('DIRECT_RECEIVE', itemNo, 'INVENTORY', `Direct received ${actualQty} of ${itemNo} to ${locationName}/${subLocation} by ${userId}`);
     res.json({ message: 'Stock updated successfully (Direct Receive)' });
 
   } catch (err) {
-    // (ย้าย transaction.rollback() มาไว้ใน catch block หลัก)
-    // await transaction.rollback(); // (ถ้า transaction ถูกสร้างแล้ว)
+    // (ถ้า transaction ถูกสร้างแล้ว ให้ rollback)
+    // await transaction.rollback(); 
     console.error('Error during direct receive:', err);
     res.status(500).json({ message: err.message || 'Failed to update stock' });
   }
@@ -645,6 +677,97 @@ app.post('/api/receive/schedule', verifyToken, requireReceiveRole, async (req, r
   }
 });
 
+// ตารางสำหรับ Schedule
+
+app.get('/api/receive/schedules', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 20, 
+      search = '', 
+      sortKey = 'SCHEDULED_DATETIME',
+      sortDir = 'desc'
+    } = req.query;
+
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    const pageInt = parseInt(page, 10);
+    const limitInt = parseInt(limit, 10);
+    const offset = (pageInt - 1) * limitInt;
+
+    const allowedSortKeys = [
+      'SCHEDULE_ID', 'ITEM_NO', 'ITEM_NAME', 'SCHEDULED_DATETIME', 
+      'CONFIRM_DATETIME', 'STATUS', 'LOCATION_NAME', 'SCHEDULED_QTY', 'ACTUAL_QTY',
+      'RECEIVED_BY_NAME'
+    ];
+    const safeSortKey = allowedSortKeys.includes(sortKey) ? sortKey : 'SCHEDULED_DATETIME';
+    const safeSortDir = ['asc', 'desc'].includes(sortDir.toLowerCase()) ? sortDir.toLowerCase() : 'desc';
+
+    const whereConditions = [];
+
+    if (req.user.role !== 'ADMIN') {
+      whereConditions.push(`s.DIVISION_SCRIPT = @userDivision`);
+      request.input('userDivision', sql.NVarChar, req.user.division);
+    }
+
+    const searchTerm = (search || '').trim();
+    if (searchTerm !== '') {
+      request.input('searchTerm', sql.NVarChar, `%${searchTerm}%`);
+      whereConditions.push(`
+        (
+          s.ITEM_NO LIKE @searchTerm OR
+          i.ITEM_NAME LIKE @searchTerm OR
+          s.LOCATION_NAME LIKE @searchTerm OR
+          s.STATUS LIKE @searchTerm OR
+          u.name LIKE @searchTerm OR
+          u.name IS NULL
+        )
+        
+      `);
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    const query = `
+      SELECT 
+        s.SCHEDULE_ID,
+        s.ITEM_NO,
+        i.ITEM_NAME,
+        s.LOCATION_NAME,
+        s.STATUS,
+        s.SCHEDULED_QTY,
+        s.ACTUAL_QTY,
+        s.SCHEDULED_DATETIME,
+        s.CONFIRM_DATETIME,
+        u.name AS RECEIVED_BY_NAME,
+        COUNT(*) OVER() AS TotalCount 
+      FROM MC_SCHEDULED_RECEIVES s
+      LEFT JOIN MC_ITEM_MASTER i ON s.ITEM_NO = i.ITEM_NO
+      LEFT JOIN Users u ON s.RECEIVED_BY_USERID = u.userid
+      ${whereClause}
+      ORDER BY ${safeSortKey} ${safeSortDir}
+      OFFSET @offset ROWS
+      FETCH NEXT @limit ROWS ONLY;
+    `;
+
+    request.input('offset', sql.Int, offset);
+    request.input('limit', sql.Int, limitInt);
+
+    const result = await request.query(query);
+    const totalCount = result.recordset.length > 0 ? result.recordset[0].TotalCount : 0;
+
+    res.json({
+      data: result.recordset,
+      totalCount: totalCount
+    });
+
+  } catch (err) {
+    console.error('Error fetching receive schedules:', err);
+    res.status(500).json({ message: 'Failed to fetch receive schedules' });
+  }
+});
+
 // 2. API สำหรับดึงรายการที่ต้องยืนยัน (สำหรับ Popup)
 app.get('/api/receive/pending', verifyToken, requireReceiveRole, async (req, res) => {
   try {
@@ -689,14 +812,99 @@ app.get('/api/receive/pending', verifyToken, requireReceiveRole, async (req, res
   }
 });
 
+app.post('/api/locations', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    // 1. กำหนดค่า default ให้ subLocation (ถ้าไม่ส่งมา = '')
+    const { locationName, subLocation = '', division, description } = req.body;
+
+    // 2. แก้ไข Validation (เอา subLocation ออก)
+    if (!locationName || !division) {
+      return res.status(400).json({ message: 'Location Name and Division are required' });
+    }
+
+    const pool = await poolPromise;
+    const request = pool.request();
+    
+    request.input('locationName', sql.NVarChar, locationName);
+    request.input('subLocation', sql.NVarChar, subLocation); // <-- จะเป็น '' (ค่าว่าง) ถ้าไม่กรอก
+    request.input('division', sql.NVarChar, division);
+    request.input('description', sql.NVarChar, description || null);
+
+    // 3. ตรวจสอบข้อมูลซ้ำ
+    const checkQuery = `
+      SELECT 1 FROM MC_LOCATION_REF 
+      WHERE LOCATION_NAME = @locationName AND ISNULL(SUB_LOCATION, '') = ISNULL(@subLocation, '')
+    `;
+    const checkResult = await request.query(checkQuery);
+
+    if (checkResult.recordset.length > 0) {
+      return res.status(409).json({ message: 'This Location / Sub Location combination already exists.' });
+    }
+
+    // 4. Insert (Logic นี้ถูกต้องแล้ว)
+    const insertQuery = `
+      INSERT INTO MC_LOCATION_REF 
+        (LOCATION_NAME, SUB_LOCATION, DIVISION, DESCRIPTION, CREATE_ON)
+      VALUES 
+        (@locationName, @subLocation, @division, @description, GETDATE())
+    `;
+    
+    await request.query(insertQuery);
+    
+    await logAction('LOCATION_ADD', subLocation || 'DEFAULT', 'LOCATION', `Location ${locationName}/${subLocation || 'DEFAULT'} added by ${req.user.userid}`);
+    res.status(201).json({ message: 'Location added successfully' });
+
+  } catch (err) {
+    console.error('Error adding location:', err);
+    // (เพิ่ม Error handling สำหรับ PK ซ้ำ)
+    if (err.number === 2627 || err.number === 2601) { // Unique constraint violation
+        return res.status(409).json({ message: 'This Location / Sub Location combination already exists.' });
+    }
+    res.status(500).json({ message: 'Failed to add location' });
+  }
+});
+
+//  API: Get Locations based on User's Division
+app.get('/api/locations', verifyToken, requireReceiveRole, async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+    
+    const whereConditions = [];
+    // กรองตาม Division ถ้าไม่ใช่ Admin
+    if (req.user.role !== 'ADMIN') {
+      whereConditions.push(`DIVISION = @userDivision`);
+      request.input('userDivision', sql.NVarChar, req.user.division);
+    }
+    
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    const query = `
+      SELECT LOCATION_NAME, SUB_LOCATION
+      FROM MC_LOCATION_REF
+      ${whereClause}
+      ORDER BY LOCATION_NAME, SUB_LOCATION;
+    `;
+    
+    const result = await request.query(query);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('Error fetching locations:', err);
+    res.status(500).json({ message: 'Failed to fetch locations' });
+  }
+});
+
 // 3. API สำหรับยืนยันการรับของ (Confirm Receive)
 app.post('/api/receive/confirm/:scheduleId', verifyToken, requireReceiveRole, async (req, res) => {
   const { scheduleId } = req.params;
-  const { actualQty } = req.body;
+  
+  // 1. กำหนดค่า default ให้ subLocation (ถ้าไม่ส่งมา = '')
+  const { actualQty, locationName, subLocation = '' } = req.body; 
   const userId = req.user.userid;
 
-  if (actualQty === undefined || actualQty === null) {
-    return res.status(400).json({ message: 'Actual Qty is required' });
+  // 2. เอา !subLocation ออกจาก Validation
+  if (actualQty === undefined || actualQty === null || !locationName) {
+    return res.status(400).json({ message: 'Actual Qty and Location are required' });
   }
 
   const pool = await poolPromise;
@@ -705,11 +913,12 @@ app.post('/api/receive/confirm/:scheduleId', verifyToken, requireReceiveRole, as
   try {
     await transaction.begin();
 
-    // --- Step 1: อัปเดตตาราง Schedule และดึงข้อมูล Item No, Location ออกมา ---
     const scheduleRequest = transaction.request();
     scheduleRequest.input('scheduleId', sql.Int, scheduleId);
     scheduleRequest.input('actualQty', sql.Decimal(18, 4), parseFloat(actualQty));
     scheduleRequest.input('userId', sql.NVarChar, userId);
+    scheduleRequest.input('finalLocationName', sql.NVarChar, locationName);
+    scheduleRequest.input('finalSubLocation', sql.NVarChar, subLocation); // <-- ส่ง '' (ค่าว่าง) เข้า DB ถ้าไม่มี
 
     const updateScheduleQuery = `
       UPDATE MC_SCHEDULED_RECEIVES
@@ -717,138 +926,186 @@ app.post('/api/receive/confirm/:scheduleId', verifyToken, requireReceiveRole, as
         STATUS = 'CONFIRMED',
         ACTUAL_QTY = @actualQty,
         RECEIVED_BY_USERID = @userId,
-        CONFIRM_DATETIME = GETDATE()
+        CONFIRM_DATETIME = GETDATE(),
+        LOCATION_NAME = @finalLocationName,
+        SUB_LOCATION_NAME = @finalSubLocation -- <-- อัปเดต (อาจจะเป็นค่าว่าง)
       OUTPUT 
         inserted.ITEM_NO, 
-        inserted.LOCATION_NAME,
         inserted.ACTUAL_QTY
       WHERE 
         SCHEDULE_ID = @scheduleId AND STATUS = 'PENDING';
     `;
     
     const scheduleResult = await scheduleRequest.query(updateScheduleQuery);
-
+    
     if (scheduleResult.recordset.length === 0) {
       throw new Error('Schedule not found or already confirmed');
     }
-
-    const { ITEM_NO, LOCATION_NAME, ACTUAL_QTY } = scheduleResult.recordset[0];
-    
-    // --- Step 2: อัปเดต (หรือเพิ่ม) สต็อกใน MC_INVENTORY_STOCK (Upsert) ---
+    const { ITEM_NO, ACTUAL_QTY } = scheduleResult.recordset[0];
     const stockRequest = transaction.request();
     stockRequest.input('itemNo', sql.NVarChar, ITEM_NO);
-    stockRequest.input('locationName', sql.NVarChar, LOCATION_NAME);
-    stockRequest.input('receivedQty', sql.Decimal(18, 4), ACTUAL_QTY); // ใช้ Qty ที่กรอกจริง
+    stockRequest.input('locationName', sql.NVarChar, locationName);
+    stockRequest.input('subLocation', sql.NVarChar, subLocation); // <-- ส่ง '' (ค่าว่าง)
+    stockRequest.input('receivedQty', sql.Decimal(18, 4), ACTUAL_QTY);
 
     const mergeStockQuery = `
       MERGE INTO MC_INVENTORY_STOCK AS target
-      USING (SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME) AS source
-      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
-      
+      USING (
+        SELECT @itemNo AS ITEM_NO, @locationName AS LOCATION_NAME, @subLocation AS SUB_LOCATION
+      ) AS source
+      ON (
+        target.ITEM_NO = source.ITEM_NO AND 
+        target.LOCATION_NAME = source.LOCATION_NAME AND
+        ISNULL(target.SUB_LOCATION, '') = ISNULL(source.SUB_LOCATION, '') -- <-- Logic นี้รองรับค่าว่างอยู่แล้ว
+      )
       WHEN MATCHED THEN
-        -- ถ้าเจอ Item และ Location นี้: ให้อัปเดต QTY
         UPDATE SET 
           QTY = target.QTY + @receivedQty,
           LAST_UPDATE = GETDATE()
-          
       WHEN NOT MATCHED THEN
-        -- ถ้าไม่เจอ: ให้เพิ่มแถวใหม่
-        INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
-        VALUES (@itemNo, @locationName, @receivedQty, GETDATE());
+        INSERT (ITEM_NO, LOCATION_NAME, SUB_LOCATION, QTY, LAST_UPDATE)
+        VALUES (@itemNo, @locationName, @subLocation, @receivedQty, GETDATE());
     `;
-
     await stockRequest.query(mergeStockQuery);
-
-    // --- Step 3: ถ้าทุกอย่างสำเร็จ ให้ Commit Transaction ---
     await transaction.commit();
-    
-    await logAction('RECEIVE_CONFIRM', scheduleId, 'RECEIVE', `Confirmed schedule ${scheduleId} with QTY ${actualQty}`);
+    await logAction(
+      'RECEIVE_CONFIRM', 
+      scheduleId, 
+      'RECEIVE', 
+      `Confirmed ${ACTUAL_QTY} of ${ITEM_NO} to ${locationName}/${subLocation || 'DEFAULT'} by ${userId} (ScheduleID: ${scheduleId})`
+    );
     res.json({ message: 'Receive confirmed and stock updated successfully' });
 
   } catch (err) {
-    // --- Step 4: ถ้ามีอะไรพลาด ให้ Rollback ---
     await transaction.rollback();
     console.error('Error confirming receive:', err);
     res.status(500).json({ message: err.message || 'Failed to confirm receive' });
   }
 });
 
+// Canle Shchedul
+app.post('/api/receive/cancel/:scheduleId', verifyToken, requireReceiveRole, async (req, res) => {
+  const { scheduleId } = req.params;
+  const userId = req.user.userid; // User ที่กดยกเลิก
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+    request.input('scheduleId', sql.Int, scheduleId);
+    request.input('userId', sql.NVarChar, userId);
+
+    const updateQuery = `
+      UPDATE MC_SCHEDULED_RECEIVES
+      SET 
+        STATUS = 'CANCELLED', -- << เปลี่ยนสถานะ
+        RECEIVED_BY_USERID = @userId, -- เก็บว่าใครเป็นคนยกเลิก
+        CONFIRM_DATETIME = GETDATE() -- ใช้วันที่ยกเลิก
+      WHERE 
+        SCHEDULE_ID = @scheduleId AND STATUS = 'PENDING'; -- ยกเลิกได้เฉพาะ PENDING
+    `;
+    
+    const result = await request.query(updateQuery);
+
+    if (result.rowsAffected[0] === 0) {
+      return res.status(404).json({ message: 'Schedule not found or not in PENDING status' });
+    }
+    
+    await logAction('RECEIVE_CANCEL', scheduleId, 'RECEIVE', `Cancelled schedule ${scheduleId} by ${userId}`);
+    res.json({ message: 'Schedule cancelled successfully' });
+
+  } catch (err) {
+    console.error('Error cancelling schedule:', err);
+    res.status(500).json({ message: 'Failed to cancel schedule' });
+  }
+});
+
 // 4. API สำหรับย้ายของ (Transfer Stock)
 app.post('/api/inventory/transfer', verifyToken, requireReceiveRole, async (req, res) => {
-  const { itemNo, locationFrom, locationTo, transferQty } = req.body;
+  // 1. กำหนดค่า default
+  const { itemNo, locationFrom, subLocationFrom = '', locationTo, subLocationTo = '', transferQty } = req.body;
   const userId = req.user.userid;
 
+  // 2. เอา !subLocation ออก
   if (!itemNo || !locationFrom || !locationTo || !transferQty || transferQty <= 0) {
-    return res.status(400).json({ message: 'Missing fields or invalid transfer Qty' });
+    return res.status(400).json({ message: 'Item No, From Location, To Location, and Qty are required' });
   }
-  if (locationFrom === locationTo) {
+  
+  // (แก้ validation กันย้ายที่เดิม)
+  if (locationFrom === locationTo && subLocationFrom === subLocationTo) { 
     return res.status(400).json({ message: 'From and To locations cannot be the same' });
   }
-
+  
   const pool = await poolPromise;
-  // --- ADDED VALIDATION ---
+  const transaction = pool.transaction();
   try {
-    const stockCheckRequest = pool.request();
-    stockCheckRequest.input('itemNo', sql.NVarChar, itemNo);
-    // เช็คว่ามี Item นี้ในสต็อก (ที่ใดก็ได้) อย่างน้อย 1 แถวหรือไม่
-    const stockResult = await stockCheckRequest.query('SELECT 1 FROM MC_INVENTORY_STOCK WHERE ITEM_NO = @itemNo');
-    
-    if (stockResult.recordset.length === 0) {
-      return res.status(404).json({ message: 'ไม่พบ Item นี้ในสต็อก (MC_INVENTORY_STOCK), ไม่สามารถ Transfer ได้' });
-    }
-
-    const transaction = pool.transaction();
     await transaction.begin();
-    
     const qty = parseFloat(transferQty);
-
-    // --- Step 1: ลด QTY จาก Location ต้นทาง (Upsert ด้วย MERGE) ---
+    
+    // Step 1: FROM
     const fromRequest = transaction.request();
     fromRequest.input('itemNo', sql.NVarChar, itemNo);
     fromRequest.input('locationFrom', sql.NVarChar, locationFrom);
+    fromRequest.input('subLocationFrom', sql.NVarChar, subLocationFrom); // <-- ส่ง '' (ค่าว่าง)
     fromRequest.input('transferQty', sql.Decimal(18, 4), qty);
     
     const mergeFromQuery = `
       MERGE INTO MC_INVENTORY_STOCK AS target
-      USING (SELECT @itemNo AS ITEM_NO, @locationFrom AS LOCATION_NAME) AS source
-      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      USING (
+        SELECT @itemNo AS ITEM_NO, @locationFrom AS LOCATION_NAME, @subLocationFrom AS SUB_LOCATION
+      ) AS source
+      ON (
+        target.ITEM_NO = source.ITEM_NO AND 
+        target.LOCATION_NAME = source.LOCATION_NAME AND
+        ISNULL(target.SUB_LOCATION, '') = ISNULL(source.SUB_LOCATION, '')
+      )
       WHEN MATCHED THEN
           UPDATE SET 
             QTY = target.QTY - @transferQty, 
             LAST_UPDATE = GETDATE()
       WHEN NOT MATCHED THEN
-          INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
-          VALUES (@itemNo, @locationFrom, -@transferQty, GETDATE());
+          INSERT (ITEM_NO, LOCATION_NAME, SUB_LOCATION, QTY, LAST_UPDATE)
+          VALUES (@itemNo, @locationFrom, @subLocationFrom, -@transferQty, GETDATE());
     `;
     await fromRequest.query(mergeFromQuery);
 
-    // --- Step 2: เพิ่ม QTY ไปยัง Location ปลายทาง (Upsert ด้วย MERGE) ---
+    // Step 2: TO
     const toRequest = transaction.request();
     toRequest.input('itemNo', sql.NVarChar, itemNo);
     toRequest.input('locationTo', sql.NVarChar, locationTo);
+    toRequest.input('subLocationTo', sql.NVarChar, subLocationTo); // <-- ส่ง '' (ค่าว่าง)
     toRequest.input('transferQty', sql.Decimal(18, 4), qty);
 
     const mergeToQuery = `
       MERGE INTO MC_INVENTORY_STOCK AS target
-      USING (SELECT @itemNo AS ITEM_NO, @locationTo AS LOCATION_NAME) AS source
-      ON (target.ITEM_NO = source.ITEM_NO AND target.LOCATION_NAME = source.LOCATION_NAME)
+      USING (
+        SELECT @itemNo AS ITEM_NO, @locationTo AS LOCATION_NAME, @subLocationTo AS SUB_LOCATION
+      ) AS source
+      ON (
+        target.ITEM_NO = source.ITEM_NO AND 
+        target.LOCATION_NAME = source.LOCATION_NAME AND
+        ISNULL(target.SUB_LOCATION, '') = ISNULL(source.SUB_LOCATION, '')
+      )
       WHEN MATCHED THEN
           UPDATE SET 
             QTY = target.QTY + @transferQty, 
             LAST_UPDATE = GETDATE()
       WHEN NOT MATCHED THEN
-          INSERT (ITEM_NO, LOCATION_NAME, QTY, LAST_UPDATE)
-          VALUES (@itemNo, @locationTo, @transferQty, GETDATE());
+          INSERT (ITEM_NO, LOCATION_NAME, SUB_LOCATION, QTY, LAST_UPDATE)
+          VALUES (@itemNo, @locationTo, @subLocationTo, @transferQty, GETDATE());
     `;
     await toRequest.query(mergeToQuery);
 
-    // --- Step 3: Commit ---
     await transaction.commit();
-    await logAction('TRANSFER', itemNo, 'INVENTORY', `...`);
+    await logAction(
+      'TRANSFER', 
+      itemNo, 
+      'INVENTORY', 
+      `Transferred ${qty} of ${itemNo} from ${locationFrom}/${subLocationFrom || 'DEFAULT'} to ${locationTo}/${subLocationTo || 'DEFAULT'} by ${userId}`
+    );
     res.json({ message: 'Stock transferred successfully' });
 
   } catch (err) {
-    // await transaction.rollback(); // (ถ้า transaction ถูกสร้างแล้ว)
+    await transaction.rollback();
     console.error('Error transferring stock:', err);
     res.status(500).json({ message: err.message || 'Failed to transfer stock' });
   }
@@ -862,14 +1119,14 @@ app.get('/api/item-master/check/:itemNo', verifyToken, requireReceiveRole, async
     const request = pool.request();
     request.input('itemNo', sql.NVarChar, itemNo);
     
-    const result = await request.query('SELECT ITEM_NO, ITEM_NAME FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
+    const result = await request.query('SELECT ITEM_NO, ITEM_NAME, SPEC FROM MC_ITEM_MASTER WHERE ITEM_NO = @itemNo');
     
     if (result.recordset.length === 0) {
       return res.status(404).json({ message: 'ไม่พบ item no นี้ กรุณาตรวจสอบใหม่อีกครั้ง' });
     }
     
     // ส่งชื่อ Item กลับไปด้วย
-    res.json(result.recordset[0]); // { ITEM_NO: "...", ITEM_NAME: "..." }
+    res.json(result.recordset[0]);
     
   } catch (err) {
     console.error('Error checking item master:', err);
@@ -885,14 +1142,18 @@ app.get('/api/inventory/stock/:itemNo', verifyToken, requireReceiveRole, async (
     const request = pool.request();
     request.input('itemNo', sql.NVarChar, itemNo);
 
-    // Query เฉพาะตาราง Stock
-    const result = await request.query('SELECT LOCATION_NAME, QTY FROM MC_INVENTORY_STOCK WHERE ITEM_NO = @itemNo AND QTY != 0');
+    // 1. อัปเกรด Query: เพิ่ม SUB_LOCATION และ ORDER BY
+    const result = await request.query(`
+      SELECT LOCATION_NAME, SUB_LOCATION, QTY 
+      FROM MC_INVENTORY_STOCK 
+      WHERE ITEM_NO = @itemNo AND QTY > 0
+      ORDER BY LOCATION_NAME, SUB_LOCATION
+    `);
     
     if (result.recordset.length === 0) {
       return res.status(404).json({ message: 'ไม่พบ Item นี้ในสต็อก (หรือ QTY เป็น 0)' });
     }
     
-    // ส่งกลับเป็น Array [ { LOCATION_NAME: "F6", QTY: 100 }, ... ]
     res.json(result.recordset); 
     
   } catch (err) {
@@ -904,33 +1165,33 @@ app.get('/api/inventory/stock/:itemNo', verifyToken, requireReceiveRole, async (
 // 5. API สำหรับหน้า Stock View (แสดง Card)
 app.get('/api/inventory/stock', verifyToken, requireReceiveRole, async (req, res) => {
   try {
-    const { search = '', location = 'ALL' } = req.query; // รับค่า search/location
+    const { search = '', location = 'ALL' } = req.query; 
 
     const pool = await poolPromise;
     const request = pool.request();
 
-    // สร้างเงื่อนไข WHERE ตามสิทธิ์
     const whereConditions = [];
-
-    // กรองสิทธิ์ตาม Division ที่ User ถืออยู่ (เหมือนเดิม)
+    
     if (req.user.role !== 'ADMIN') {
-      whereConditions.push(`i.division = @userDivision`); 
+      whereConditions.push(`i.DIVISION_SCRIPT = @userDivision`); 
       request.input('userDivision', sql.NVarChar, req.user.division);
     }
     
-    // --- เพิ่ม: กรองตาม Location (ถ้าไม่ใช่ 'ALL') ---
     if (location !== 'ALL') {
       whereConditions.push(`s.LOCATION_NAME = @location`);
       request.input('location', sql.NVarChar, location);
     }
     
-    // --- เพิ่ม: กรองตาม Search Term ---
     if (search) {
-      whereConditions.push(`(s.ITEM_NO LIKE @searchTerm OR i.ITEM_NAME LIKE @searchTerm)`);
+      // เพิ่ม SUB_LOCATION ในการค้นหา
+      whereConditions.push(`(
+        s.ITEM_NO LIKE @searchTerm OR 
+        i.ITEM_NAME LIKE @searchTerm OR 
+        s.SUB_LOCATION LIKE @searchTerm
+      )`);
       request.input('searchTerm', sql.NVarChar, `%${search}%`);
     }
 
-    // รวม WHERE ทั้งหมด
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
     
     const query = `
@@ -938,11 +1199,13 @@ app.get('/api/inventory/stock', verifyToken, requireReceiveRole, async (req, res
         s.ITEM_NO, 
         i.ITEM_NAME, 
         s.LOCATION_NAME, 
+        s.SUB_LOCATION, -- 1. เอา SUB_LOCATION มาด้วย
         s.QTY
       FROM MC_INVENTORY_STOCK s
       LEFT JOIN MC_ITEM_MASTER i ON s.ITEM_NO = i.ITEM_NO
       ${whereClause}
-      ORDER BY s.ITEM_NO, s.LOCATION_NAME;
+      AND s.QTY > 0 -- ซ่อนสต็อก 0
+      ORDER BY s.ITEM_NO, s.LOCATION_NAME, s.SUB_LOCATION; -- 2. Sort
     `;
     
     const result = await request.query(query);
@@ -1036,35 +1299,22 @@ app.get('/api/item-master', verifyToken, async (req, res) => {
     // 3.2: เงื่อนไขตามสิทธิ์ (Role/Division/Org)
     // (แก้ไข Logic ที่พังในโค้ดเดิมของคุณ)
     if (req.user.role !== 'ADMIN') {
-      if (req.user.division === 'M/P 1') {
-        whereConditions.push(`r.division = 'M/P 1'`); // สมมติว่ามีคอลัมน์ 'division'
-      } else if (req.user.division === 'M/P 2') {
-        whereConditions.push(`r.division = 'M/P 2'`); // สมมติว่ามีคอลัมน์ 'division'
-        
-        // เพิ่ม Logic การกรอง 'org' ที่ขาดหายไป
-        const userOrgs = req.user.org.split(',').map(org => org.trim()).filter(Boolean);
-        if (userOrgs.length > 0) {
-          const orgParams = userOrgs.map((org, index) => `@org${index}`);
-          whereConditions.push(`r.ORGN_CODE IN (${orgParams.join(',')})`); // สมมติว่าเช็คจาก ORGN_CODE
-          userOrgs.forEach((org, index) => {
-            request.input(`org${index}`, sql.VarChar, org);
-          });
-        }
-      } else if (req.user.division === 'Common') {
-        // เพิ่ม Logic การกรอง 'org' ที่ขาดหายไป
-        const userOrgs = req.user.org.split(',').map(org => org.trim()).filter(Boolean);
-        if (userOrgs.length > 0) {
-          const orgParams = userOrgs.map((org, index) => `@org${index}`);
-          whereConditions.push(`r.ORGN_CODE IN (${orgParams.join(',')})`); // สมมติว่าเช็คจาก ORGN_CODE
-          userOrgs.forEach((org, index) => {
-            request.input(`org${index}`, sql.VarChar, org);
-          });
-        }
-      } else {
-         // User ทั่วไปที่ไม่ใช่ ADMIN แต่ไม่มี Division พิเศษ? (ใส่ Logic ของคุณ)
-         // อาจจะ Block เลย หรือกรองตาม userid
-         // whereConditions.push(`r.CREATED_BY = @userid`);
-         // request.input('userid', sql.VarChar, req.user.userid);
+      
+      // 1. กรองด้วย Division (ใช้ DIVISION_SCRIPT ให้ตรงกับ API อื่น)
+      whereConditions.push(`r.DIVISION_SCRIPT = @userDivision`);
+      request.input('userDivision', sql.NVarChar, req.user.division);
+
+      // 2. กรองด้วย Org (ถ้า User คนนั้นมี Org)
+      // (ดึง org ของ user มา, ถ้าไม่มีให้เป็น string ว่าง)
+      const userOrgs = (req.user.org || '').split(',').map(org => org.trim()).filter(Boolean);
+      
+      if (userOrgs.length > 0) {
+        // ถ้า user มี org, ให้กรองเฉพาะ org ที่เขามีสิทธิ์
+        const orgParams = userOrgs.map((org, index) => `@org${index}`);
+        whereConditions.push(`r.ORGN_CODE IN (${orgParams.join(',')})`);
+        userOrgs.forEach((org, index) => {
+          request.input(`org${index}`, sql.VarChar, org);
+        });
       }
     }
 
@@ -1072,8 +1322,6 @@ app.get('/api/item-master', verifyToken, async (req, res) => {
     const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
 
     // --- 4. สร้าง Final Query ---
-    // ใช้ COUNT(*) OVER() เพื่อเอาจำนวนทั้งหมด (TotalCount) มาด้วยใน query เดียว
-    // ใช้ OFFSET ... FETCH ... เพื่อแบ่งหน้า
     const query = `
       SELECT 
         r.ITEM_NO, 

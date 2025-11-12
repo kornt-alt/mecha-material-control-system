@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Container, Card, Spinner, Alert, Row, Col, Form, InputGroup, Button } from 'react-bootstrap'; // เพิ่ม Form, InputGroup, Button
-import { AlertCircle, Archive, Search, XCircle } from 'lucide-react'; // เพิ่ม Search, XCircle
-import { apiCall } from '../App'; 
-import { useDebounce } from './hooks/useDebounce'; // (สมมติว่าคุณมี useDebounce hook)
+import { Archive, Search, XCircle } from 'lucide-react'; // เพิ่ม Search, XCircle
+import { apiCall } from '../../App'; 
+import { useDebounce } from '../hooks/useDebounce';
 
 const InventoryView = () => {
   const [stock, setStock] = useState([]);
@@ -36,6 +36,25 @@ const InventoryView = () => {
   useEffect(() => {
     fetchStock();
   }, [fetchStock]);
+
+  const [allLocations, setAllLocations] = useState([]);
+  const [loadingLocations, setLoadingLocations] = useState(false);
+
+  useEffect(() => {
+    const fetchLocations = async () => {
+      setLoadingLocations(true);
+      try {
+        const locData = await apiCall('/locations'); // ← ตรงกับ API ที่คุณมี
+        const uniqueLocs = [...new Set(locData.map(loc => loc.LOCATION_NAME))].sort();
+        setAllLocations(uniqueLocs);
+      } catch (err) {
+        setError('Failed to load location list');
+      } finally {
+        setLoadingLocations(false);
+      }
+    };
+    fetchLocations();
+  }, []);
 
   const resetFilters = () => {
     setSearchTerm('');
@@ -73,7 +92,7 @@ const InventoryView = () => {
           <Form onSubmit={(e) => e.preventDefault()}>
             <Row className="g-3">
               <Col md={8}>
-                <Form.Label>Search (Item No / Name)</Form.Label>
+                <Form.Label>Search (Item No / Name / Sub Location)</Form.Label> {/* <-- แก้ Text */}
                 <InputGroup>
                   <InputGroup.Text><Search size={16} /></InputGroup.Text>
                   <Form.Control
@@ -85,26 +104,33 @@ const InventoryView = () => {
                 </InputGroup>
               </Col>
               <Col md={4}>
-                <Form.Label>Filter Location</Form.Label>
+                <Form.Label>Filter by Location</Form.Label>
                 <Form.Select
                   value={locationFilter}
                   onChange={(e) => setLocationFilter(e.target.value)}
+                  disabled={loadingLocations}
                 >
                   <option value="ALL">All Locations</option>
-                  <option value="FACTORY_6">Factory 6</option>
-                  <option value="FACTORY_7">Factory 7</option>
+                  {allLocations.map(loc => (
+                    <option key={loc} value={loc}>{loc}</option>
+                  ))}
                 </Form.Select>
               </Col>
             </Row>
-            <Button variant="link" size="sm" onClick={resetFilters} className="mt-2">
-              <XCircle size={14} /> Reset Filters
+            <Button
+              variant="outline-secondary"
+              onClick={resetFilters}
+              disabled={searchTerm === '' && locationFilter === 'ALL'}
+            >
+              <XCircle size={16} className="me-1" />
+              Reset Filters
             </Button>
           </Form>
         </Card.Body>
       </Card>
       
       {/* --- Stock Display --- */}
-      {error && <Alert variant="danger">...{error}</Alert>}
+      {error && <Alert variant="danger">{error}</Alert>}
       
       {loading ? (
         <div className="text-center"><Spinner /></div>
@@ -115,7 +141,7 @@ const InventoryView = () => {
               <p className="text-muted">No stock available for this criteria.</p>
             </Col>
           ) : (
-            stock.map((item, index) => {
+            stock.map((item, index) => { // <-- item มี SUB_LOCATION แล้ว
               const cardStyle = getCardStyle(item.QTY);
               const textStyle = getQtyTextStyle(item.QTY);
               
@@ -123,7 +149,7 @@ const InventoryView = () => {
                 <Col key={index}>
                   <Card 
                     className="h-100" 
-                    border={cardStyle.border ? cardStyle.border.split(' ')[2] : undefined} // 'warning'
+                    border={cardStyle.border ? cardStyle.border.split(' ')[2] : undefined}
                     bg={cardStyle.bg}
                     style={{ borderWidth: cardStyle.border ? '2px' : '1px' }}
                   >
@@ -135,6 +161,9 @@ const InventoryView = () => {
                       <hr />
                       <Card.Text>
                         <strong>Location:</strong> {item.LOCATION_NAME}
+                        <br />
+                        {/* --- (แก้ไข) แสดงผล Sub Location --- */}
+                        <strong>Sub Location:</strong> {item.SUB_LOCATION || 'DEFAULT'}
                         <br />
                         <strong className={textStyle}>
                           QTY: {parseFloat(item.QTY).toFixed(2)}

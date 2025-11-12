@@ -11,7 +11,7 @@ const Register = ({ onSuccess }) => {
     password: '',
     confirmPassword: '',
     name: '',
-    role: 'Common',
+    role: 'RECEIVE',
     division: 'M/P 1'
   });
   const [error, setError] = useState('');
@@ -185,8 +185,8 @@ const Register = ({ onSuccess }) => {
                 value={formData.role}
                 onChange={(e) => setFormData({ ...formData, role: e.target.value })}
               >
-                <option value="RECEIVE">RECEIVE (PD)</option>
-                <option value="ISSUE">ISSUE (MC)</option>
+                <option value="RECEIVE">RECEIVE (MC)</option>
+                <option value="ISSUE">ISSUE (PD)</option>
                 <option value="ADMIN">ADMIN</option>
               </Form.Select>
             </Form.Group>

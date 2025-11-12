@@ -15,11 +15,17 @@ import Logout from './components/manage_user/Logout';
 import Register from './components/manage_user/Register';
 
 // Inventory & Item Components
-import ItemMaster from './components/Item_Master';
-import PendingReceiveModal from './components/PendingReceiveModal';
-import ReceiveMaterial from './components/ReceiveMaterial'; // <-- แก้ไข Path 
-import InventoryView from './components/InventoryView';
-import TransferMaterial from './components/TransferMaterial';
+
+// Inventory
+import AddLocation from './components/inventory/AddLocation'
+import InventoryView from './components/inventory/InventoryView';
+import ItemMaster from './components/inventory/Item_Master';
+
+// Transaction-Inventory
+import PendingReceiveModal from './components/transaction_inventory/PendingReceiveModal';
+import ReceiveMaterial from './components/transaction_inventory/ReceiveMaterial'; // <-- แก้ไข Path 
+import TransferMaterial from './components/transaction_inventory/TransferMaterial';
+import ScheduleHistory from './components/transaction_inventory/ScheduleHistory';
 
 // const API_BASE = 'http://10.121.1.85:3202/api';
 const API_BASE = 'http://localhost:5000/api';
@@ -105,7 +111,7 @@ const ConditionalNavbar = ({ user, onLogout, pendingCount }) => {
               <NavDropdown 
                 title={
                   <span>
-                    Inventory 
+                    Transaction Inventory 
                     {/* Badge สำหรับ Notification */}
                     {pendingCount > 0 && (
                       <Badge pill bg="danger" className="ms-1">{pendingCount}</Badge>
@@ -117,11 +123,36 @@ const ConditionalNavbar = ({ user, onLogout, pendingCount }) => {
                 <NavDropdown.Item as={Link} to="/receive-material">
                   รับเข้า Mat'l
                 </NavDropdown.Item>
-                <NavDropdown.Item as={Link} to="/inventory">
-                  ตรวจสอบ Stock
+                <NavDropdown.Item as={Link} to="/schedule-history">
+                  รายการรับเข้าล่วงหน้า
+                  {pendingCount > 0 && (
+                      <Badge pill bg="danger" className="ms-1">{pendingCount}</Badge>
+                    )}
                 </NavDropdown.Item>
                 <NavDropdown.Item as={Link} to="/transfer-material">
                   Transfer Stock
+                </NavDropdown.Item>
+              </NavDropdown>
+            )}
+            
+            {/* Inventory Menu (สำหรับ RECEIVE & ADMIN) */}
+            {canAccessReceive && (
+              <NavDropdown 
+                title={
+                  <span>
+                    Inventory 
+                  </span>
+                } 
+                id="inventory-dropdown"
+              >
+                <NavDropdown.Item as={Link} to="/add-location">
+                  เพิ่ม Location
+                </NavDropdown.Item>
+                <NavDropdown.Item as={Link} to="/inventory">
+                  ตรวจสอบ Stock
+                </NavDropdown.Item>
+                <NavDropdown.Item as={Link} to="/item-master">
+                  Item Master
                 </NavDropdown.Item>
               </NavDropdown>
             )}
@@ -140,6 +171,8 @@ const ConditionalNavbar = ({ user, onLogout, pendingCount }) => {
 
             <Nav.Link as={Link} to="/about">About</Nav.Link>
           </Nav>
+
+          
 
           {/* Right Nav */}
           <Nav>
@@ -228,7 +261,6 @@ const App = () => {
     // --- 3. UPDATED: เพิ่ม dependency ---
   }, [showConfirmModal, loadingPopup, snoozeUntil]); 
 
-  // Timer: (เหมือนเดิม)
   useEffect(() => {
     if (isLoggedIn) {
       checkPendingReceives(); 
@@ -283,6 +315,8 @@ const App = () => {
         <Route path="/receive-material" element={<ProtectedRoute><ReceiveMaterial /></ProtectedRoute>} />
         <Route path="/inventory" element={<ProtectedRoute><InventoryView /></ProtectedRoute>} />
         <Route path="/transfer-material" element={<ProtectedRoute><TransferMaterial /></ProtectedRoute>} />
+        <Route path="/schedule-history" element={<ProtectedRoute><ScheduleHistory /></ProtectedRoute>} />
+        <Route path="/add-location" element={<ProtectedRoute><AddLocation /></ProtectedRoute>} />
 
         {/* Admin Routes */}
         <Route path="/item-master" element={<ProtectedRoute><ItemMaster /></ProtectedRoute>} />
